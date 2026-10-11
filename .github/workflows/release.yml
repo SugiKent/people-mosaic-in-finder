@@ -1,0 +1,109 @@
+name: Build and release installer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize publication, including manual reruns, so an older build cannot
+# replace a newer successful release as Latest.
+concurrency:
+  group: installer-release-main
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the triggering commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install test tools and runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ffmpeg zsh libegl1 libopengl0
+          python -m pip install uv==0.9.3
+          uv sync --frozen --dev
+      - name: Validate source and installer
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          uv run --frozen ruff check src scripts tests
+          uv run --frozen ruff format --check src scripts tests
+          uv run --frozen pytest -q
+          zsh -n Install.command scripts/*.command
+      - name: Build the source installer ZIP
+        run: python scripts/package_release.py --ref "$GITHUB_SHA"
+      - name: Store ZIP and checksum for publication
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: macOS-arm64-installer
+          path: |
+            build/releases/*.zip
+            build/releases/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download the validated installer
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: macOS-arm64-installer
+          path: release
+      - name: Publish a release for this main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          main_sha=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')
+          if [[ "$main_sha" != "$GITHUB_SHA" ]]; then
+            echo 'A newer main commit is available; skip publishing this older build.'
+            exit 0
+          fi
+          tag="main-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:8}"
+          if gh release view "$tag" --json url > /dev/null 2>&1; then
+            echo "Release $tag already exists; keep its published assets unchanged."
+            exit 0
+          fi
+          cd release
+          sha256sum --check --strict ./*.zip.sha256
+          cat > release-notes.md <<'NOTES'
+          Apple Silicon Mac 向けのソースインストーラーです。署名済みの単体アプリではありません。
+
+          1. `People-Mosaic-*-macOS-arm64.zip` をダウンロードして展開します。
+          2. `Install.command` を開きます。
+          3. 依存関係のセットアップと Finder アクションの登録が完了したら、`~/Applications/People Mosaic.app` からも起動できます。
+
+          本体は `~/Library/Application Support/People Mosaic` 配下のバージョン別フォルダにインストールします。
+          完了後は、ダウンロードした ZIP と展開したフォルダを削除できます。
+          あらかじめ Homebrew をインストールしてください。初回はネット接続が必要です。Python、FFmpeg、顔認識モデルは Mac 上で取得します。
+          詳しい手順と macOS の確認画面への対処は、同梱の README.md を参照してください。
+          NOTES
+          # Keep the Markdown code delimiters literal.
+          # shellcheck disable=SC2016
+          printf '\nSource commit: `%s`\n' "$GITHUB_SHA" >> release-notes.md
+          gh release create "$tag" ./*.zip ./*.zip.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "People Mosaic — ${tag}" \
+            --notes-file release-notes.md \
+            --latest

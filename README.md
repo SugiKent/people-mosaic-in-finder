@@ -41,7 +41,24 @@ MKV は QuickTime Player で再生できない場合があります。HDR MP4 �
 
 PNG は 20 MB 以下、縦横 32〜4096 ピクセル。中央の縦横 50% を十分な濃さの画像で覆ってください。読み込み時に中央を不透明にし、周辺の透過は維持します。顔の縦横より十分大きく配置し、不透明な中央で顔を覆います。白い雲は最初から入っています。
 
-## インストール
+## ZIP からインストール
+
+macOS 15 以降の Apple Silicon の Mac 向けです。git clone や手動 build は不要です。
+
+1. [Homebrew 公式サイト](https://brew.sh/ja/) の手順で Homebrew を準備します。
+2. [最新の GitHub Release](https://github.com/SugiKent/people-mosaic-in-finder/releases/latest) の **`People-Mosaic-0.1.0-macOS-arm64.zip`** をダウンロードします。GitHub が自動生成する「Source code (zip)」ではなく、名前に `macOS-arm64` が入った ZIP を選んでください。
+3. ZIP を展開し、**`Install.command`** を開きます。足りない uv・FFmpeg・Python 3.12 を Homebrew で取得し、ライブラリと顔モデルを準備して Finder に登録します。初回はネット接続が必要です。
+4. Finder で動画を右クリック → **クイックアクション → People Mosaic**。単独で開く場合は **`~/Applications/People Mosaic.app`** を開きます。
+
+署名済みの単体アプリではなく、ソースを準備するインストーラーです。macOS が起動を止めた場合は、システム設定の **プライバシーとセキュリティ → このまま開く** で、この `Install.command` の実行を許可してください。[Apple の案内](https://support.apple.com/ja-jp/102445)も参照できます。
+
+本体は `~/Library/Application Support/People Mosaic/versions/` の版ごとのフォルダへ保存します。インストール完了後は、ダウンロードした ZIP と展開フォルダを削除できます。Finder アクションは `~/Library/Services/People Mosaic.workflow` です。既にこのツールのアクションがある場合はバックアップして新版へ切り替えます。同名の別アプリ・別アクションは上書きしません。
+
+更新は People Mosaic を閉じてから、新しい Release の ZIP を展開して `Install.command` を開くだけです。以前の版は保持し、準備に失敗した場合は起動先を切り替えません。起動時に GitHub から自動更新することはありません。
+
+ZIP 版を削除する場合は `~/Applications/People Mosaic.app`、`~/Library/Services/People Mosaic.workflow`、`~/Library/Application Support/People Mosaic` をゴミ箱へ移動します。Homebrew の共用ツールは削除しません。
+
+## clone してインストール・開発
 
 この手順は macOS 15 以降の Apple Silicon の Mac（M1 Max / 64GB を想定）向けです。ターミナルを使用します。Homebrew が未導入なら、先に [Homebrew 公式サイト](https://brew.sh/ja/) の手順でインストールしてください。
 
@@ -82,7 +99,7 @@ open "build/People Mosaic.app"
 
 「透過 PNG を選ぶ」から独自の雲画像を読み込めます。完成した動画は入力と同じフォルダに `_mosaic.mp4` または `_mosaic.mkv` を付けて保存されます。
 
-## 更新・再インストール・削除
+## clone 版の更新・再インストール・削除
 
 アプリを閉じ、プロジェクトのフォルダ内で更新します。
 
@@ -116,6 +133,18 @@ uv sync --frozen --python /opt/homebrew/bin/python3.12
 ./scripts/launch.command /absolute/path/to/video.mp4
 ```
 
-検証記録は [docs/quality/validation.md](docs/quality/validation.md)、画質・顔を表示する判定・プライバシーの契約は [docs/domain/video-masking/contracts.md](docs/domain/video-masking/contracts.md) を参照してください。
+検証記録は [validation.md](https://github.com/SugiKent/people-mosaic-in-finder/blob/main/docs/quality/validation.md)、画質・顔を表示する判定・プライバシーの契約は [contracts.md](https://github.com/SugiKent/people-mosaic-in-finder/blob/main/docs/domain/video-masking/contracts.md) を参照してください。
+
+## Release の作成
+
+main への push（PR のマージを含む）で GitHub Actions がテスト・ZIP の作成・Release の公開まで実行します。最新版の main と一致するビルドだけ公開し、実行番号とコミットを含む固有タグを使います。既存の公開 ZIP は上書きしません。手動実行も main から可能です。
+
+ローカルで ZIP だけ作る場合は、必要なソースをコミットしてから実行します。
+
+```sh
+.venv/bin/python scripts/package_release.py --ref HEAD
+```
+
+`build/releases/` に ZIP と SHA256 ファイルが生成されます。ZIP は指定したコミットのソース・インストーラーだけを含み、個人の動画、顔モデル、仮想環境、生成画像は含みません。アプリと Finder の起動用ファイルは、各 Mac のインストール先で生成します。
 
 顔検出と識別は [OpenCV の YuNet / SFace](https://docs.opencv.org/4.12.0/d0/dd4/tutorial_dnn_face.html)、保存用の可逆圧縮は [FFV1](https://github.com/FFmpeg/FFV1) を使用しています。HLG グラフィックスの基準白は [ITU-R BT.2408](https://www.itu.int/dms_pub/itu-r/opb/rep/R-REP-BT.2408-8-2024-PDF-E.pdf) を参照しています。
