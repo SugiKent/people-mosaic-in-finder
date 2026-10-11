@@ -87,3 +87,22 @@ def test_hlg_graphics_reference_white_and_untouched_10bit_samples():
     for i in range(3):
         assert np.array_equal(native_plane(frame, i)[:10, :10], before[i][:10, :10])
     assert 705 < native_plane(frame, 0)[50, 70] < 725
+
+
+def test_cloud_core_becomes_opaque_without_changing_perimeter_or_uploaded_file(tmp_path):
+    path = tmp_path / "generated-cloud.png"
+    rgba = np.full((64, 64, 4), 240, np.uint8)
+    rgba[:, :, 3] = 60
+    rgba[16:48, 16:48, 3] = 147
+    Image.fromarray(rgba).save(path)
+    before = path.read_bytes()
+    loaded = load_png(path)
+    assert np.all(loaded[16:48, 16:48, 3] == 255)
+    assert np.array_equal(loaded[:, :, :3], rgba[:, :, :3])
+    assert np.array_equal(loaded[:16], rgba[:16])
+    assert np.array_equal(loaded[48:], rgba[48:])
+    assert path.read_bytes() == before
+    rgba[30, 30, 3] = 127
+    Image.fromarray(rgba).save(path)
+    with pytest.raises(UserError):
+        load_png(path)

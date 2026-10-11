@@ -46,8 +46,11 @@ def load_png(path: Path) -> np.ndarray:
             raise UserError("32〜4096 ピクセルの PNG を選んでください。")
         rgba = np.asarray(image.convert("RGBA")).copy()
     h, w = rgba.shape[:2]
-    if rgba[h // 4 : math.ceil(3 * h / 4), w // 4 : math.ceil(3 * w / 4), 3].min() < 255:
-        raise UserError("顔が透けないよう、PNG 中央の縦横 50% は不透明にしてください。")
+    centre = rgba[h // 4 : math.ceil(3 * h / 4), w // 4 : math.ceil(3 * w / 4), 3]
+    if centre.min() < 128:
+        raise UserError("PNG 中央の縦横 50% を、不透明または十分な濃さの画像で覆ってください。")
+    # Hide the source face completely, retaining the uploaded perimeter alpha.
+    centre[:] = 255
     return rgba
 
 

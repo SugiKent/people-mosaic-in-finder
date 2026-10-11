@@ -2,14 +2,20 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
+from itertools import chain
 from pathlib import Path
-from threading import Event
+from threading import Event, local
 
 import av
 import cv2
 import numpy as np
+from av.codec.hwaccel import HWAccel, hwdevices_available
 
 from .color import display_bgr
 from .domain import CLUSTER_THRESHOLD, Analysis, Face, Person, hidden_faces, identify, iou
@@ -93,31 +99,186 @@ def oriented(frame: av.VideoFrame, rotation: int) -> av.VideoFrame:
     return rotated
 
 
-def follow(previous_gray: np.ndarray, gray: np.ndarray, face: Face) -> tuple:
-    x, y, w, h = face.box
-    points = np.array(
-        [[[x + w * fx, y + h * fy]] for fx in (0.2, 0.5, 0.8) for fy in (0.2, 0.5, 0.8)],
-        dtype=np.float32,
+# Four two-thread inference lanes target the eight performance cores of M1 Max.
+# Each lane owns
+# its networks; sharing a FaceDetectorYN/FaceRecognizerSF across threads is unsafe.
+ANALYSIS_WORKERS = 4
+OPENCV_THREADS = 2
+TRACKING_LONG_EDGE = 960
+
+
+def tracking_gray(bgr: np.ndarray) -> np.ndarray:
+    height, width = bgr.shape[:2]
+    scale = min(1.0, TRACKING_LONG_EDGE / max(width, height))
+    if scale < 1:
+        bgr = cv2.resize(
+            bgr,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+
+def follow_all(
+    previous_gray: np.ndarray, gray: np.ndarray, faces: list[Face], width: int, height: int
+) -> list[tuple]:
+    """Build optical-flow pyramids once for all faces, in a small tracking image."""
+    if not faces:
+        return []
+    scale = np.array([gray.shape[1] / width, gray.shape[0] / height], np.float32)
+    points = (
+        np.array(
+            [
+                [[x + w * fx, y + h * fy]]
+                for face in faces
+                for x, y, w, h in [face.box]
+                for fx in (0.2, 0.5, 0.8)
+                for fy in (0.2, 0.5, 0.8)
+            ],
+            dtype=np.float32,
+        )
+        * scale
     )
     moved, status, _ = cv2.calcOpticalFlowPyrLK(previous_gray, gray, points, None)
-    if moved is None or status is None or int(status.sum()) < 4:
-        return face.box
-    delta = np.median((moved - points)[status.ravel() == 1], axis=0).ravel()
-    if np.linalg.norm(delta) > max(w, h):
-        return face.box
-    return (x + float(delta[0]), y + float(delta[1]), w, h)
+    boxes = []
+    for index, face in enumerate(faces):
+        box = face.box
+        if moved is not None and status is not None:
+            part = slice(index * 9, (index + 1) * 9)
+            valid = status[part].ravel() == 1
+            if int(valid.sum()) >= 4:
+                delta = np.median((moved[part] - points[part])[valid], axis=0).ravel() / scale
+                if np.all(np.isfinite(delta)) and np.linalg.norm(delta) <= max(box[2:]):
+                    box = (box[0] + float(delta[0]), box[1] + float(delta[1]), *box[2:])
+        boxes.append(box)
+    return boxes
 
 
-def analyze(path: Path, progress: Callable, cancel: Event) -> Analysis:
+class FrameAnalyzer:
+    def __init__(
+        self,
+        detector_path: Path,
+        recognizer_path: Path,
+        rotation: int,
+        cancel: Event,
+        max_edge: int | None = None,
+    ):
+        self.detector_path, self.recognizer_path = detector_path, recognizer_path
+        self.rotation, self.cancel = rotation, cancel
+        self.max_edge = max_edge
+        self.lane = local()
+
+    def __call__(self, original: av.VideoFrame) -> tuple:
+        check_cancel(self.cancel)
+        if not hasattr(self.lane, "detector"):
+            self.lane.detector = cv2.FaceDetectorYN.create(
+                str(self.detector_path), "", (320, 320), 0.65, 0.3, 5000
+            )
+            self.lane.recognizer = cv2.FaceRecognizerSF.create(str(self.recognizer_path), "")
+        bgr = original.to_ndarray(format="bgr24")
+        if self.rotation:
+            bgr = np.ascontiguousarray(np.rot90(bgr, self.rotation))
+        height, width = bgr.shape[:2]
+        detection_image = bgr
+        if self.max_edge and max(width, height) > self.max_edge:
+            scale = self.max_edge / max(width, height)
+            detection_image = cv2.resize(
+                bgr,
+                (max(1, round(width * scale)), max(1, round(height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        dh, dw = detection_image.shape[:2]
+        self.lane.detector.setInputSize((dw, dh))
+        _, detections = self.lane.detector.detect(detection_image)
+        if detections is not None and (dw, dh) != (width, height):
+            # Restore boxes and all five landmarks before identity alignment.
+            detections[:, :14:2] *= width / dw
+            detections[:, 1:14:2] *= height / dh
+        found = []
+        for detection in detections if detections is not None else []:
+            check_cancel(self.cancel)
+            face = Face(tuple(float(value) for value in detection[:4]))
+            aligned = None
+            if min(face.box[2:]) >= 32 and detection[-1] >= 0.85:
+                aligned = self.lane.recognizer.alignCrop(bgr, detection)
+                feature = self.lane.recognizer.feature(aligned).ravel().copy()
+                feature /= max(float(np.linalg.norm(feature)), 1e-10)
+                face.feature = feature
+            found.append((face, aligned))
+        return float(original.pts * original.time_base), found, tracking_gray(detection_image)
+
+
+@contextmanager
+def analysis_decoder(path: Path, hardware: bool):
+    """Use Apple media decoding for analysis, falling back before any results."""
+    use_hardware = hardware and sys.platform == "darwin" and "videotoolbox" in hwdevices_available()
+    container = None
+    try:
+        for accelerated in [True, False] if use_hardware else [False]:
+            try:
+                options = (
+                    {"hwaccel": HWAccel("videotoolbox", allow_software_fallback=True)}
+                    if accelerated
+                    else {}
+                )
+                container = av.open(str(path), **options)
+                stream = container.streams.video[0]
+                stream.thread_type = "AUTO"
+                stream.codec_context.thread_count = 2
+                decoded = iter(container.decode(stream))
+                first = next(decoded, None)
+                break
+            except av.error.FFmpegError:
+                if container is not None:
+                    container.close()
+                    container = None
+                if not accelerated:
+                    raise
+        yield stream, chain([first], decoded) if first is not None else iter(())
+    finally:
+        if container is not None:
+            container.close()
+
+
+def analyzed_frames(decoded: Iterator, analyze_frame: Callable, cancel: Event) -> Iterator[tuple]:
+    """Bound queued 4K frames and preserve decode order, including VFR timestamps."""
+    pending = deque()
+    executor = ThreadPoolExecutor(max_workers=ANALYSIS_WORKERS, thread_name_prefix="face")
+    try:
+        for original in decoded:
+            check_cancel(cancel)
+            if original.pts is None:
+                raise UserError("時刻情報のない動画は処理できません。")
+            pending.append(executor.submit(analyze_frame, original))
+            if len(pending) >= ANALYSIS_WORKERS * 2:
+                yield pending.popleft().result()
+        while pending:
+            check_cancel(cancel)
+            yield pending.popleft().result()
+    finally:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def analyze(
+    path: Path,
+    progress: Callable,
+    cancel: Event,
+    max_edge: int | None = 1920,
+    *,
+    hardware: bool = True,
+) -> Analysis:
     info = probe(path)
     fingerprint = digest(path)
     detector_path, recognizer_path = model_paths()
-    detector = cv2.FaceDetectorYN.create(str(detector_path), "", (320, 320), 0.65, 0.3, 5000)
-    recognizer = cv2.FaceRecognizerSF.create(str(recognizer_path), "")
+    cv2.setNumThreads(OPENCV_THREADS)
+    analyze_frame = FrameAnalyzer(
+        detector_path, recognizer_path, info["rotation"], cancel, max_edge
+    )
     previous_gray = None
     held: list[tuple[Face, float]] = []
-    with av.open(str(path)) as container:
-        stream = container.streams.video[0]
+    with analysis_decoder(path, hardware) as (stream, decoded):
         fps = float(stream.average_rate or stream.base_rate or 30)
         duration = float(stream.duration * stream.time_base) if stream.duration else 0
         width, height = info["width"], info["height"]
@@ -125,59 +286,54 @@ def analyze(path: Path, progress: Callable, cancel: Event) -> Analysis:
             width, height = height, width
         analysis = Analysis(path, fingerprint, width, height, fps)
         analysis.hlg = info.get("color_transfer") == "arib-std-b67"
-        for index, original in enumerate(container.decode(stream)):
-            check_cancel(cancel)
-            if original.pts is None:
-                raise UserError("時刻情報のない動画は処理できません。")
-            timestamp = float(original.pts * original.time_base)
-            if analysis.times and timestamp <= analysis.times[-1]:
-                raise UserError("動画の時刻情報が不正です。")
-            frame = oriented(original, info["rotation"])
-            bgr = frame.to_ndarray(format="bgr24")
-            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            detector.setInputSize((width, height))
-            _, detections = detector.detect(bgr)
-            faces = []
-            for detection in detections if detections is not None else []:
-                box = tuple(float(value) for value in detection[:4])
-                face = Face(box)
-                if min(box[2:]) >= 32 and detection[-1] >= 0.85:
-                    aligned = recognizer.alignCrop(bgr, detection)
-                    feature = recognizer.feature(aligned).ravel().copy()
-                    feature /= max(float(np.linalg.norm(feature)), 1e-10)
-                    person, confident = identify(feature, analysis.people)
-                    scores = [float(feature @ p.feature) for p in analysis.people]
-                    if (
-                        person is None
-                        and (not scores or max(scores) < CLUSTER_THRESHOLD)
-                        and len(analysis.people) < 256
-                    ):
-                        person = len(analysis.people)
-                        analysis.people.append(Person(feature, aligned.copy(), index))
-                        confident = True
-                    elif person is not None:
-                        analysis.people[person].count += 1
-                    face.person, face.confident, face.feature = person, confident, feature
-                faces.append(face)
-            # Tracking never grants an exemption. A missed/reacquired face is hidden.
-            next_held = [(face, timestamp) for face in faces]
-            if previous_gray is not None and np.mean(cv2.absdiff(gray, previous_gray)) < 45:
-                for old, last_seen in held:
-                    if timestamp - last_seen > 0.5:
-                        continue
-                    moved = Face(follow(previous_gray, gray, old))
-                    if not any(iou(moved.box, face.box) > 0.2 for face in faces):
-                        faces.append(moved)
-                        next_held.append((moved, last_seen))
-            held, previous_gray = next_held, gray
-            analysis.frames.append(faces)
-            analysis.times.append(timestamp)
-            if index % 8 == 0:
-                relative = timestamp - analysis.times[0]
-                progress(
-                    min(95, int(relative / duration * 95)) if duration else 0,
-                    f"顔を検出中 · {index + 1:,} フレーム",
-                )
+        with closing(analyzed_frames(decoded, analyze_frame, cancel)) as results:
+            for index, (timestamp, found, gray) in enumerate(results):
+                check_cancel(cancel)
+                if analysis.times and timestamp <= analysis.times[-1]:
+                    raise UserError("動画の時刻情報が不正です。")
+                faces = []
+                for face, aligned in found:
+                    feature = face.feature
+                    if feature is not None:
+                        person, confident = identify(feature, analysis.people)
+                        scores = [float(feature @ p.feature) for p in analysis.people]
+                        if (
+                            person is None
+                            and (not scores or max(scores) < CLUSTER_THRESHOLD)
+                            and len(analysis.people) < 256
+                        ):
+                            person = len(analysis.people)
+                            analysis.people.append(Person(feature, aligned.copy(), index))
+                            confident = True
+                        elif person is not None:
+                            analysis.people[person].count += 1
+                        face.person, face.confident, face.feature = person, confident, feature
+                    faces.append(face)
+                # Tracking never grants an exemption. A missed/reacquired face is hidden.
+                next_held = [(face, timestamp) for face in faces]
+                if previous_gray is not None and np.mean(cv2.absdiff(gray, previous_gray)) < 45:
+                    eligible = [
+                        (face, last_seen)
+                        for face, last_seen in held
+                        if timestamp - last_seen <= 0.5
+                    ]
+                    boxes = follow_all(
+                        previous_gray, gray, [face for face, _ in eligible], width, height
+                    )
+                    for box, (_, last_seen) in zip(boxes, eligible, strict=True):
+                        moved = Face(box)
+                        if not any(iou(moved.box, face.box) > 0.2 for face in faces):
+                            faces.append(moved)
+                            next_held.append((moved, last_seen))
+                held, previous_gray = next_held, gray
+                analysis.frames.append(faces)
+                analysis.times.append(timestamp)
+                if index % 8 == 0:
+                    relative = timestamp - analysis.times[0]
+                    progress(
+                        min(95, int(relative / duration * 95)) if duration else 0,
+                        f"顔を検出中 · {index + 1:,} フレーム",
+                    )
     if not analysis.frames:
         raise UserError("映像フレームがありません。")
     # Later clusters can make an earlier classification ambiguous: re-evaluate all.

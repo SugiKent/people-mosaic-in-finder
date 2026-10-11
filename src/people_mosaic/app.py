@@ -140,6 +140,7 @@ class Window(QMainWindow):
     def __init__(self, initial: Path | None = None):
         super().__init__()
         self.analysis = None
+        self.input_path = None
         self.worker = None
         self.rgba = cloud()
         self.manual = []
@@ -165,6 +166,17 @@ class Window(QMainWindow):
         self.filename = QLabel("動画・顔の画像はこの Mac の中だけで処理します")
         top.addWidget(self.filename, 1)
         layout.addLayout(top)
+        analysis_row = QHBoxLayout()
+        analysis_row.addWidget(QLabel("顔の解析"))
+        self.analysis_mode = QComboBox()
+        self.analysis_mode.addItems(["高速 · 長辺 1920px", "小さい顔重視 · 元の解像度"])
+        self.analysis_mode.setAccessibleName("顔の解析方法")
+        self.analysis_mode.currentIndexChanged.connect(self.reanalyze)
+        analysis_row.addWidget(self.analysis_mode)
+        analysis_note = QLabel("出力は元の解像度。小さい顔が漏れる場合は元の解像度で再解析。")
+        analysis_note.setWordWrap(True)
+        analysis_row.addWidget(analysis_note, 1)
+        layout.addLayout(analysis_row)
         split = QSplitter()
         self.canvas = Canvas()
         self.canvas.region_added.connect(self.add_region)
@@ -274,6 +286,7 @@ class Window(QMainWindow):
         ready = self.analysis is not None and not busy
         self.canvas.setEnabled(ready)
         self.open_button.setEnabled(not busy)
+        self.analysis_mode.setEnabled(not busy)
         for widget in (
             self.people,
             self.reset_button,
@@ -305,9 +318,15 @@ class Window(QMainWindow):
         if path:
             self.load_video(Path(path))
 
+    def reanalyze(self):
+        if self.input_path and not self.busy():
+            self.load_video(self.input_path)
+
     def load_video(self, path):
         if self.busy():
             return
+        self.input_path = path.resolve()
+        max_edge = 1920 if self.analysis_mode.currentIndex() == 0 else None
         self.stop_play()
         self.analysis = None
         self.format_changed()
@@ -322,7 +341,8 @@ class Window(QMainWindow):
         self.setWindowTitle(f"People Mosaic · {path.name}")
         self.region_note.setText("ドラッグで追加 · 動画全体の同じ位置を隠します")
         self.start_work(
-            lambda progress, cancel: engine.analyze(path.resolve(), progress, cancel), self.analyzed
+            lambda progress, cancel: engine.analyze(path.resolve(), progress, cancel, max_edge),
+            self.analyzed,
         )
 
     def start_work(self, operation, success):
