@@ -84,3 +84,4 @@
 - main への push（PR マージを含む）でテスト・ZIP 作成・Release 公開を実行する GitHub Actions を追加。最新版 main のコミットだけを公開し、固有タグとソースコミットを記録。Workflow は actionlint / ShellCheck に成功。
 - 全体の自動テスト **84 件成功**。Ruff lint / format check、diff check が成功。
 - 初回の Linux CI ではシステム FFmpeg 6.1.1 による映像コピー時に、可変フレームレートの最終フレームが 50ms から約 76.7ms に再計算され、MP4 の 2 ケースが失敗。外部 FFmpeg は音声のみを AAC へ変換し、PyAV で最終結合するよう修正。既存の 2ms 未満の許容差は維持し、最終結合前後で映像パケットの PTS / DTS / duration / 圧縮データがすべて一致する検証を追加。
+- 最終結合では `opaque=True` で不要なエンコーダーの初期化を避け、元の codec tag を明示的に保持。実 HLG 69 フレームの結合前後で `hvc1` / 10bit / BT.2020 / HLG のタグが一致することを確認。

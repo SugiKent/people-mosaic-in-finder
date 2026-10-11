@@ -497,7 +497,8 @@ def remux_public_mp4(video_path: Path, audio_path: Path, output: Path, cancel: E
         streams = {}
         for source in (video, audio):
             for stream in source.streams:
-                target = dest.add_stream_from_template(stream)
+                target = dest.add_stream_from_template(stream, opaque=True)
+                target.codec_context.codec_tag = stream.codec_context.codec_tag
                 target.metadata.clear()
                 streams[(id(source), stream.index)] = target
 
