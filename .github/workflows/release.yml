@@ -72,7 +72,8 @@ jobs:
         run: |
           version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
           .venv/bin/python scripts/verify_bundle.py \
-            --zip "build/releases/People-Mosaic-${version}-macOS-arm64.zip"
+            --zip "build/releases/People-Mosaic-${version}-macOS-arm64.zip" \
+            --finder-registration
       - name: Store ZIP and checksum for publication
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:

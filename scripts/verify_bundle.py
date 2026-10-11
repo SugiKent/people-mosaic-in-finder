@@ -2,7 +2,8 @@
 
 All installation paths are under a temporary home. The downloaded package is
 removed before the installed application is tested; the actual user's Finder
-services and Applications directory are never touched.
+services and Applications directory are never touched by the default checks.
+An explicit GitHub Actions-only check temporarily registers one unique workflow.
 """
 
 import argparse
@@ -15,8 +16,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from pathlib import Path, PurePosixPath
+from uuid import uuid4
 from zipfile import ZipFile
 
 from package_release import bundle_files
@@ -123,7 +126,80 @@ def expected_manifest() -> dict:
     return {"format": 2, "kind": "app-bundle", "version": version, "commit": commit, "dirty": False}
 
 
-def verify(zip_path: Path) -> None:
+def service_registered(dump: str, workflow: Path, menu: str) -> bool:
+    """Match a path and menu within one service from pbs' diagnostic output.
+
+    pbs emits an Objective-C description, including NSData descriptions, rather
+    than a parseable plist. CI paths and generated identifiers are ASCII, so no
+    localization or escaped Unicode is involved in this diagnostic match.
+    """
+    pattern = r'NSBundlePath\s*=\s*"([^"\n]+)"\s*;(?P<body>.*?)(?=NSBundlePath\s*=|\Z)'
+    for entry in re.finditer(pattern, dump, re.S):
+        if entry.group(1) == str(workflow):
+            return bool(re.search(r'default\s*=\s*"' + re.escape(menu) + r'"\s*;', entry["body"]))
+    return False
+
+
+def finder_registration(executable: Path, source_workflow: Path) -> None:
+    """Exercise native service discovery only on a disposable macOS CI runner."""
+    if os.environ.get("GITHUB_ACTIONS") != "true" or sys.platform != "darwin":
+        raise ValueError("Finder registration check is restricted to macOS GitHub Actions")
+    home = Path.home()
+    services = home / "Library/Services"
+    token = uuid4().hex
+    menu = f"People Mosaic CI {token}"
+    workflow = services / f"{menu}.workflow"
+    if not str(workflow).isascii() or '"' in str(workflow) or "\\" in str(workflow):
+        raise ValueError("Finder diagnostic requires an unescaped ASCII runner home")
+    if workflow.exists() or workflow.is_symlink():
+        raise ValueError(f"Refusing to replace an existing workflow: {workflow}")
+    env = offline_environment(home)
+    services.mkdir(parents=True, exist_ok=True)
+    # mkdir is exclusive: cleanup only starts once this check owns the path.
+    workflow.mkdir()
+    owner = workflow / ".people-mosaic-ci-owner"
+    owner.write_text(token)
+    try:
+        shutil.copytree(source_workflow, workflow, dirs_exist_ok=True)
+        info_path = workflow / "Contents/Info.plist"
+        info = plistlib.loads(info_path.read_bytes())
+        info.update({"CFBundleIdentifier": f"local.people-mosaic.ci.{token}", "CFBundleName": menu})
+        info["NSServices"][0]["NSMenuItem"] = {"default": menu}
+        info_path.write_bytes(plistlib.dumps(info))
+        run_offline([str(executable), "--refresh-services"], env, timeout=20)
+        deadline = time.monotonic() + 15
+        last_dump = ""
+        last_error = ""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError(
+                    f"Native service discovery did not register {workflow}; "
+                    f"pbs diagnostic: {last_error or last_dump[-2000:]}"
+                )
+            result = subprocess.run(
+                ["/System/Library/CoreServices/pbs", "-dump"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=min(5, remaining),
+                env=env,
+            )
+            last_dump = result.stdout
+            last_error = result.stderr
+            if service_registered(last_dump, workflow, menu):
+                break
+            time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+    finally:
+        if workflow.is_symlink() or not owner.is_file() or owner.read_text() != token:
+            raise ValueError(f"Refusing to remove an unowned CI workflow: {workflow}")
+        shutil.rmtree(workflow)
+        # Cleanup uses the same public API and never changes enable preferences.
+        run_offline([str(executable), "--refresh-services"], env, timeout=20)
+    print(json.dumps({"finder_service_registered": True, "gui_visibility_verified": False}))
+
+
+def verify(zip_path: Path, *, check_finder_registration: bool = False) -> None:
     if sys.platform != "darwin":
         raise ValueError("Bundle verification requires Apple Silicon macOS")
     manifest = expected_manifest()
@@ -198,6 +274,8 @@ def verify(zip_path: Path) -> None:
             path.resolve().relative_to(root / "Processed outputs")
             if not path.is_file() or path.stat().st_size == 0:
                 raise ValueError("Smoke test output is missing")
+        if check_finder_registration:
+            finder_registration(Path(entry), workflow.parent.parent)
         print(
             json.dumps(
                 {
@@ -213,9 +291,10 @@ def verify(zip_path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zip", type=Path, required=True)
+    parser.add_argument("--finder-registration", action="store_true")
     args = parser.parse_args()
     try:
-        verify(args.zip)
+        verify(args.zip, check_finder_registration=args.finder_registration)
     except (
         OSError,
         ValueError,

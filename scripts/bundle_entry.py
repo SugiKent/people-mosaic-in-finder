@@ -130,6 +130,11 @@ def main():
                 print(f"インストール完了: {app}")
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
             raise SystemExit(f"インストールを完了できませんでした: {error}") from error
+    elif sys.argv[1:] == ["--refresh-services"]:
+        from build_macos import refresh_services
+
+        refresh_services()
+        print("Finder のサービス一覧を更新しました。")
     elif sys.argv[1:] == ["--self-test"]:
         self_test()
     elif len(sys.argv) == 3 and sys.argv[1] == "--smoke-test":
