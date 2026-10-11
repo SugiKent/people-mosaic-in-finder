@@ -298,7 +298,9 @@ def build(args: argparse.Namespace) -> Path:
     manifest_file = work / "RELEASE.json"
     manifest_file.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     data = model_data(ROOT) + [(str(manifest_file), ".")]
-    license_root = args.licenses_dir
+    # PyInstaller resolves data sources relative to the generated .spec file,
+    # whereas CLI paths are relative to the builder's working directory.
+    license_root = args.licenses_dir.resolve()
     if not license_root.is_dir() and not args.allow_dirty:
         raise ValueError("Collect third-party licenses before building a release")
     if license_root.is_dir():

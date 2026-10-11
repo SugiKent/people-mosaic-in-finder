@@ -1,9 +1,11 @@
 """Bundled tools must carry every external dependency and public model only."""
 
+import ast
 import hashlib
 import importlib.util
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -193,3 +195,45 @@ def test_relative_build_paths_resolve_rpath_identically(tmp_path, monkeypatch):
         == library
     )
     assert builder.resolve_dependency("@rpath/libcodec.dylib", tool, tool) == library
+
+
+def test_relative_license_cli_path_is_readable_from_generated_spec(tmp_path, monkeypatch):
+    checkout = tmp_path / "checkout"
+    notices = checkout / "build/bundle-licenses"
+    notices.mkdir(parents=True)
+    (notices / "FFMPEG-BUILD.json").write_bytes(b"exact build provenance")
+    monkeypatch.chdir(checkout)
+    monkeypatch.setattr(builder, "ROOT", checkout)
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    monkeypatch.setattr(builder.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(builder, "source_manifest", lambda *a: {"version": "0.1.0"})
+    monkeypatch.setattr(builder, "model_data", lambda _: [])
+    monkeypatch.setattr(builder, "binary_closure", lambda _: [])
+    monkeypatch.setattr(builder, "external_library_references", lambda _: [])
+    collected = []
+
+    def pyinstaller(command, **kwargs):
+        spec = Path(command[-1])
+        assignment = ast.parse(spec.read_text()).body[0]
+        sources = ast.literal_eval(
+            next(keyword.value for keyword in assignment.value.keywords if keyword.arg == "datas")
+        )
+        for source, destination in sources:
+            # The data consumer resolves relative paths from the .spec directory,
+            # which is a different directory from the CLI's checkout root.
+            path = Path(source)
+            content = (path if path.is_absolute() else spec.parent / path).read_bytes()
+            collected.append((destination, content))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(builder.subprocess, "run", pyinstaller)
+    builder.build(
+        SimpleNamespace(
+            allow_dirty=False,
+            licenses_dir=Path("build/bundle-licenses"),
+            ffmpeg=Path("tools/ffmpeg"),
+            ffprobe=Path("tools/ffprobe"),
+            output_dir=checkout / "dist",
+        )
+    )
+    assert ("licenses", b"exact build provenance") in collected

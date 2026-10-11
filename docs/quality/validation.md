@@ -109,4 +109,5 @@
 - 初回の同梱アプリを、ネット通信を拒否し PATH をシステムのみにした環境で起動。顔モデルの初期化と ffmpeg / ffprobe の呼び出し、12 フレームの解析、雲を重ねた MKV / MP4、PCM → AAC、MP4 の連番、MKV の加工外の画素保持を確認。これはローカルの同梱ランタイム検証で、ダウンロード時の Gatekeeper 確認や Finder 実画面の検証ではない。
 - 最終 ZIP の検証スクリプトは、空白と日本語を含む一時 HOME へインストールし、展開元を削除してから同梱実行ファイルの self-test と動画処理を実行する。GitHub Actions はこの検証を通過した ZIP と対応ソース・チェックサムを公開する。
 - 同梱ライセンスと対応する実際の上流ソースを収集。モデルの実体 SHA と commit 固定のライセンス SHA、portable Python の対応ソース SHA を検証する。Qt / FFmpeg などのソースは同じ Release に独立した Sources ZIP として添付する。
-- 全体の自動テスト **129 件成功**。Ruff lint / format check、diff check が成功。
+- CI の相対パス指定でライセンスの取り込みが失敗したため、生成する PyInstaller spec の入力を絶対パスへ正規化。生成した spec の場所から実際にファイルを読む回帰試験を追加。
+- 全体の自動テスト **130 件成功**。Ruff lint / format check、diff check が成功。
