@@ -229,18 +229,31 @@ def install_at_paths(
     return app
 
 
+def finish_install(app: Path) -> None:
+    from build_macos import refresh_services
+
+    try:
+        refresh_services()
+    except (OSError, AttributeError) as error:
+        raise ValueError(
+            f"アプリは保存しましたが、Finder の登録更新に失敗しました: {error}。"
+            "Install.command を再実行してください。"
+        ) from error
+    print(f"インストール完了: {app}")
+    print("Finder のサービス一覧を更新しました。動画を右クリックして People Mosaic を選べます。")
+    print("展開した ZIP フォルダは削除できます。更新も新しい ZIP の Install.command から行えます。")
+    subprocess.run(["/usr/bin/open", "-R", str(app)], check=False)
+
+
 def main():
     if sys.platform != "darwin":
         raise SystemExit("Apple Silicon の macOS 向けのインストーラです。")
     try:
         package = Path(__file__).resolve().parents[1]
         app = install(package, Path.home())
+        finish_install(app)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         raise SystemExit(f"インストールを完了できませんでした: {error}") from error
-    subprocess.run(["/System/Library/CoreServices/pbs", "-flush"], check=False)
-    print(f"インストール完了: {app}")
-    print("展開した ZIP フォルダは削除できます。更新も新しい ZIP の Install.command から行えます。")
-    subprocess.run(["/usr/bin/open", "-R", str(app)], check=False)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 """Generate a local app launcher and an Automator Finder Quick Action."""
 
+import argparse
+import ctypes
 import plistlib
 import shlex
 from pathlib import Path
@@ -7,6 +9,25 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
+APPKIT = "/System/Library/Frameworks/AppKit.framework/AppKit"
+
+
+def service_update_function():
+    """Bind the native API without changing the user's services database."""
+    appkit = ctypes.CDLL(APPKIT)
+    update = appkit.NSUpdateDynamicServices
+    update.argtypes = []
+    update.restype = None
+    return update
+
+
+def refresh_services() -> None:
+    """Notify macOS immediately after installing a service on a fresh machine.
+
+    NSUpdateDynamicServices is the public AppKit API for service discovery.
+    Flushing pbs' cache alone does not request immediate rediscovery.
+    """
+    service_update_function()()
 
 
 def build(root: Path = ROOT, *, bundled: bool = False) -> None:
@@ -53,11 +74,23 @@ def build(root: Path = ROOT, *, bundled: bool = False) -> None:
         "actions": [{"action": action, "isViewVisible": False}],
         "connectors": {},
         "workflowMetaData": {
+            "applicationBundleID": "com.apple.finder",
+            "applicationBundleIDsByPath": {
+                "/System/Library/CoreServices/Finder.app": "com.apple.finder"
+            },
+            "applicationPath": "/System/Library/CoreServices/Finder.app",
+            "applicationPaths": ["/System/Library/CoreServices/Finder.app"],
+            "inputTypeIdentifier": "com.apple.Automator.fileSystemObject.movie",
+            "outputTypeIdentifier": "com.apple.Automator.nothing",
+            "presentationMode": 15,
+            "processesInput": False,
             "serviceApplicationBundleID": "com.apple.finder",
             "serviceApplicationPath": "/System/Library/CoreServices/Finder.app",
             "serviceInputTypeIdentifier": "com.apple.Automator.fileSystemObject.movie",
             "serviceOutputTypeIdentifier": "com.apple.Automator.nothing",
-            "serviceProcessesInput": 0,
+            "serviceProcessesInput": False,
+            "systemImageName": "NSActionTemplate",
+            "useAutomaticInputType": False,
             "workflowTypeIdentifier": "com.apple.Automator.servicesMenu",
         },
     }
@@ -70,6 +103,8 @@ def build(root: Path = ROOT, *, bundled: bool = False) -> None:
         "MosaicOwner": "local.people-mosaic.release",
         "NSServices": [
             {
+                "NSBackgroundColorName": "background",
+                "NSIconName": "NSActionTemplate",
                 "NSMenuItem": {"default": "People Mosaic"},
                 "NSMessage": "runWorkflowAsService",
                 "NSSendFileTypes": ["public.movie"],
@@ -107,4 +142,9 @@ def build(root: Path = ROOT, *, bundled: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    build()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--refresh-services", action="store_true")
+    if parser.parse_args().refresh_services:
+        refresh_services()
+    else:
+        build()

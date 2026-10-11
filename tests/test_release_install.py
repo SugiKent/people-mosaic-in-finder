@@ -24,6 +24,7 @@ def load_script(name):
 
 installer = load_script("install_release")
 builder = load_script("build_macos")
+entry = load_script("bundle_entry")
 
 
 @pytest.fixture
@@ -114,6 +115,70 @@ def test_first_install_builds_at_permanent_version_path(package, home, prepare):
     # Quoting must produce executable shell syntax for a path containing spaces.
     subprocess.run(["zsh", "-n"], input=command, text=True, check=True)
     assert installer.owned_workflow(workflow)
+
+
+def test_finder_metadata_identifies_video_quick_action(package, home, prepare):
+    installer.install(package, home, prepare)
+    _, _, _, workflow = paths(home)
+    document = plistlib.loads((workflow / "Contents/document.wflow").read_bytes())
+    metadata = document["workflowMetaData"]
+    assert metadata["presentationMode"] == 15
+    assert metadata["inputTypeIdentifier"] == metadata["serviceInputTypeIdentifier"]
+    assert metadata["inputTypeIdentifier"] == "com.apple.Automator.fileSystemObject.movie"
+    assert metadata["applicationPaths"] == [metadata["serviceApplicationPath"]]
+    assert metadata["useAutomaticInputType"] is False
+    info = plistlib.loads((workflow / "Contents/Info.plist").read_bytes())
+    service = info["NSServices"][0]
+    assert service["NSSendFileTypes"] == ["public.movie"]
+    assert service["NSRequiredContext"] == {"NSApplicationIdentifier": "com.apple.finder"}
+    assert service["NSIconName"] == metadata["systemImageName"]
+
+
+def test_bundled_install_refreshes_services_after_publishing(package, home, monkeypatch):
+    events = []
+    app = home / "Applications/People Mosaic.app"
+
+    def install(package_path, home_path):
+        assert package_path == package and home_path == home
+        events.append("published")
+        return app
+
+    monkeypatch.setattr(installer, "install", install)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(builder, "refresh_services", lambda: events.append("refreshed"))
+    monkeypatch.setattr(installer.subprocess, "run", lambda argv, **kwargs: events.append(argv))
+    monkeypatch.setitem(sys.modules, "install_release", installer)
+    monkeypatch.setitem(sys.modules, "build_macos", builder)
+    monkeypatch.setattr(sys, "argv", ["PeopleMosaic", "--install", str(package)])
+    entry.main()
+    assert events == ["published", "refreshed", ["/usr/bin/open", "-R", str(app)]]
+
+
+def test_isolated_bundle_check_does_not_modify_real_services(package, home, monkeypatch):
+    monkeypatch.setattr(installer, "install", lambda *args: home / "Applications/app")
+    monkeypatch.setattr(
+        installer, "finish_install", lambda *args: pytest.fail("real services modified")
+    )
+    monkeypatch.setitem(sys.modules, "install_release", installer)
+    monkeypatch.setattr(
+        sys, "argv", ["PeopleMosaic", "--install", str(package), "--home", str(home)]
+    )
+    entry.main()
+
+
+def test_refresh_failure_does_not_report_complete_install(package, home, monkeypatch, capsys):
+    monkeypatch.setattr(installer, "install", lambda *args: home / "Applications/app")
+
+    def fail():
+        raise OSError("service refresh failed")
+
+    monkeypatch.setattr(builder, "refresh_services", fail)
+    monkeypatch.setitem(sys.modules, "install_release", installer)
+    monkeypatch.setitem(sys.modules, "build_macos", builder)
+    monkeypatch.setattr(sys, "argv", ["PeopleMosaic", "--install", str(package)])
+    with pytest.raises(SystemExit, match="Finder の登録更新に失敗"):
+        entry.main()
+    assert "インストール完了" not in capsys.readouterr().out
 
 
 def test_update_copies_bundled_models_and_reinstall_keeps_same_version_root(package, home, prepare):

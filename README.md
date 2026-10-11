@@ -61,6 +61,27 @@ ZIP 版を削除する場合は `~/Applications/People Mosaic.app`、`~/Library/
 
 ZIP 版はビルド済みなので、起動のたびに clone したソースを読み直す仕組みではありません。更新する際は新しい ZIP をインストールしてください。ソースを編集して毎回読み込ませたい場合は、次の clone 版を使います。
 
+### Finder に People Mosaic が出ないとき
+
+1. `Install.command` の画面に「インストール完了」と表示されたか確認します。展開したアプリを開くだけでは Finder に登録されません。未完了なら、最新版の ZIP の `Install.command` を実行してください。
+2. `~/Applications/People Mosaic.app` と `~/Library/Services/People Mosaic.workflow` があるか確認します。アプリを単独で開ける場合は、その画面から動画を選んで使えます。
+3. Finder で **MP4 / MOV などの動画ファイル自体**を選び、右クリックの **「サービス」**と **「クイックアクション」**の両方を確認します。フォルダや何もない場所を右クリックしても表示されません。
+4. クイックアクションの「カスタマイズ」、またはシステム設定の「キーボード → キーボードショートカット → サービス」で People Mosaic が有効か確認します。Finder 拡張の設定場所は macOS のバージョンによって異なります。[Apple の案内](https://support.apple.com/ja-jp/guide/automator/aut73234890a/mac)も参照してください。
+
+ターミナルでインストール先と設定ファイルを確認する場合は、次を実行します。ファイルや設定は変更しません。
+
+```sh
+ls -ld "$HOME/Applications/People Mosaic.app" "$HOME/Library/Services/People Mosaic.workflow"
+plutil -lint "$HOME/Library/Services/People Mosaic.workflow/Contents/Info.plist"
+plutil -lint "$HOME/Library/Services/People Mosaic.workflow/Contents/document.wflow"
+```
+
+インストール済みなのに反映されない場合、応急処置としてターミナルから次を実行し、メニューを開き直せます。これは macOS のサービス一覧を再検出する診断用ツールです。Apple は将来の提供を保証していないため、通常のインストール処理では公開 API `NSUpdateDynamicServices()` を使います。
+
+```sh
+/System/Library/CoreServices/pbs -update
+```
+
 ## clone してインストール・開発
 
 この手順は macOS 15 以降の Apple Silicon の Mac（M1 Max / 64GB を想定）向けです。ターミナルを使用します。Homebrew が未導入なら、先に [Homebrew 公式サイト](https://brew.sh/ja/) の手順でインストールしてください。

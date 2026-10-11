@@ -10,6 +10,6 @@ if [[ -e "$target" ]]; then
 fi
 mkdir -p "$HOME/Library/Services"
 /usr/bin/ditto 'build/People Mosaic.workflow' "$target"
-/System/Library/CoreServices/pbs -flush
+.venv/bin/python scripts/build_macos.py --refresh-services
 print 'Finder で動画を右クリック → クイックアクション → People Mosaic'
 print '表示されない場合は、システム設定のサービス／Finder 拡張機能で有効にしてください。'

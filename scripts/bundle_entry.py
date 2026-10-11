@@ -12,6 +12,7 @@ def self_test():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     import av
     import cv2
+    from build_macos import service_update_function
     from PySide6.QtWidgets import QApplication
 
     from people_mosaic.models import MODELS, model_paths
@@ -36,6 +37,7 @@ def self_test():
                 "python": sys.version.split()[0],
                 "models": list(MODELS),
                 "tools": tools,
+                "finder_service_update_api": service_update_function().__name__,
             }
         )
     )
@@ -116,17 +118,18 @@ def main():
         parser.add_argument("--install", type=Path, required=True)
         parser.add_argument("--home", type=Path)
         args = parser.parse_args()
-        from install_release import install
+        from install_release import finish_install, install
 
         try:
             app = install(args.install, args.home or Path.home())
+            if args.home is None:
+                finish_install(app)
+            else:
+                # Verification uses an isolated HOME and must not refresh the
+                # real user's services database or open Finder.
+                print(f"インストール完了: {app}")
         except (OSError, ValueError, subprocess.CalledProcessError) as error:
             raise SystemExit(f"インストールを完了できませんでした: {error}") from error
-        print(f"インストール完了: {app}")
-        print("展開した ZIP フォルダは削除できます。更新は新しい ZIP から行えます。")
-        if args.home is None:
-            subprocess.run(["/System/Library/CoreServices/pbs", "-flush"], check=False)
-            subprocess.run(["/usr/bin/open", "-R", str(app)], check=False)
     elif sys.argv[1:] == ["--self-test"]:
         self_test()
     elif len(sys.argv) == 3 and sys.argv[1] == "--smoke-test":

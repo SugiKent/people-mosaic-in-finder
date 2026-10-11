@@ -158,7 +158,15 @@ def verify(zip_path: Path) -> None:
         if app_manifest != manifest:
             raise ValueError("Installed app provenance does not match ZIP")
         workflow = home / "Library/Services/People Mosaic.workflow/Contents/document.wflow"
-        action = plistlib.loads(workflow.read_bytes())["actions"][0]["action"]
+        document = plistlib.loads(workflow.read_bytes())
+        metadata = document["workflowMetaData"]
+        if (
+            metadata.get("presentationMode") != 15
+            or metadata.get("inputTypeIdentifier") != "com.apple.Automator.fileSystemObject.movie"
+            or metadata.get("applicationBundleID") != "com.apple.finder"
+        ):
+            raise ValueError("Installed workflow is missing Finder Quick Action metadata")
+        action = document["actions"][0]["action"]
         command = action["ActionParameters"]["COMMAND_STRING"]
         if str(installed_root / "Contents/MacOS/PeopleMosaic") not in command:
             # Shell quoting inserts literal quote escapes for certain paths; the
@@ -176,6 +184,8 @@ def verify(zip_path: Path) -> None:
         report = json.loads(self_test.strip().splitlines()[-1])
         if report.get("frozen") is not True:
             raise ValueError("Installed executable did not use its bundled Python")
+        if report.get("finder_service_update_api") != "NSUpdateDynamicServices":
+            raise ValueError("Installed app cannot load the native Finder service refresh API")
         Path(report["resources"]).resolve().relative_to(installed_root)
         smoke_test = run_offline(
             [entry, "--smoke-test", str(root / "Processed outputs")], env, timeout=300

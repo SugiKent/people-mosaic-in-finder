@@ -111,3 +111,11 @@
 - 同梱ライセンスと対応する実際の上流ソースを収集。モデルの実体 SHA と commit 固定のライセンス SHA、portable Python の対応ソース SHA を検証する。Qt / FFmpeg などのソースは同じ Release に独立した Sources ZIP として添付する。
 - CI の相対パス指定でライセンスの取り込みが失敗したため、生成する PyInstaller spec の入力を絶対パスへ正規化。生成した spec の場所から実際にファイルを読む回帰試験を追加。
 - 全体の自動テスト **130 件成功**。Ruff lint / format check、diff check が成功。
+
+## 2026-10-12 別の Mac での Finder 登録を改善
+
+- workflow に Finder クイックアクションの入力・表示メタデータを追加。動画だけを受け取る条件と Finder への限定は維持する。
+- キャッシュ削除だけの `pbs -flush` を、Apple の公開 API `NSUpdateDynamicServices()` による一覧更新へ変更。アプリと workflow の保存後に更新し、更新に失敗した場合は完了と表示しない。ZIP 版と clone 版の登録処理で共有する。
+- 一時 HOME を指定する ZIP 検証では、実ユーザーのサービス一覧更新と Finder の起動を行わない。今回、この Mac のインストール済みサービスや有効設定も変更していない。
+- 全体の自動テスト **134 件成功**。追加試験は動画用メタデータ、公開後の更新順序、一時 HOME の隔離、登録更新失敗時の表示を確認。Ruff lint / format check、zsh 構文確認、diff check が成功。
+- ネイティブ AppKit の公開 API シンボルの存在を確認したが、実際の一覧更新は呼び出していない。報告のあった別の Mac でのメニュー表示と、この修正による解消は未確認。
