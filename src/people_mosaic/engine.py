@@ -516,6 +516,21 @@ def remux_public_mp4(video_path: Path, audio_path: Path, output: Path, cancel: E
             dest.mux(packet)
 
 
+def publish_output(final: Path, output: Path, cancel: Event) -> Path:
+    """Publish without overwriting, numbering collisions atomically."""
+    index = 0
+    while True:
+        check_cancel(cancel)
+        candidate = (
+            output if index == 0 else output.with_name(f"{output.stem}_{index}{output.suffix}")
+        )
+        try:
+            os.link(final, candidate)
+            return candidate
+        except FileExistsError:
+            index += 1
+
+
 def export(
     analysis: Analysis,
     output: Path,
@@ -526,12 +541,11 @@ def export(
     progress: Callable,
     cancel: Event,
 ) -> Path:
-    output = output.resolve()
-    if output == analysis.path.resolve() or output.exists():
-        raise UserError(
-            "元動画や既存ファイルは上書きできません。"
-            "同名の出力ファイルを移動または名前変更してから再実行してください。"
-        )
+    # Resolve the folder only: an existing output symlink is a name collision,
+    # not permission to follow its target into another folder or the input file.
+    output = output.parent.resolve() / output.name
+    if output == analysis.path.resolve():
+        raise UserError("元動画は上書きできません。")
     if digest(analysis.path) != analysis.fingerprint:
         raise UserError("解析後に元動画が変更されました。もう一度解析してください。")
     check_cancel(cancel)
@@ -671,7 +685,7 @@ def export(
         check_cancel(cancel)
         if digest(analysis.path) != analysis.fingerprint:
             raise UserError("書き出し中に元動画が変更されました。出力を破棄しました。")
-        # Hard link is atomic and refuses overwrite, including a raced-in destination.
-        os.link(final, output)
+        # Retry collisions at publication, including files created while encoding.
+        output = publish_output(final, output, cancel)
     progress(100, "書き出しが完了しました")
     return output
