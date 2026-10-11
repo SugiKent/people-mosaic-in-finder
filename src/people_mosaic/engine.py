@@ -8,6 +8,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
+from fractions import Fraction
 from itertools import chain
 from pathlib import Path
 from threading import Event, local
@@ -21,7 +22,7 @@ from .color import display_bgr
 from .domain import CLUSTER_THRESHOLD, Analysis, Face, Person, hidden_faces, identify, iou
 from .errors import UserError
 from .models import digest, model_paths
-from .overlay import SUPPORTED, blend_native, native_plane
+from .overlay import SUPPORTED, PreparedOverlay, native_plane
 
 
 class Cancelled(Exception):
@@ -95,6 +96,7 @@ def oriented(frame: av.VideoFrame, rotation: int) -> av.VideoFrame:
     for index in range(3):
         native_plane(rotated, index)[:] = np.rot90(native_plane(frame, index), rotation)
     rotated.pts, rotated.time_base = frame.pts, frame.time_base
+    rotated.duration = frame.duration
     rotated.colorspace, rotated.color_range = frame.colorspace, frame.color_range
     return rotated
 
@@ -363,6 +365,108 @@ def preview_frame(analysis: Analysis, index: int) -> np.ndarray:
     raise UserError("プレビューを読み込めませんでした。")
 
 
+# Limit the working set to eight native frames; each lane has a private PNG cache.
+EXPORT_WORKERS = 4
+EXPORT_PENDING = EXPORT_WORKERS * 2
+
+
+class FrameCompositor:
+    def __init__(self, rgba, rotation, hlg, pixel_format, cancel):
+        self.rgba, self.rotation, self.hlg = rgba, rotation, hlg
+        self.pixel_format, self.cancel = pixel_format, cancel
+        self.lane = local()
+
+    def __call__(self, original, masks):
+        check_cancel(self.cancel)
+        if not hasattr(self.lane, "overlay"):
+            self.lane.overlay = PreparedOverlay(self.rgba)
+        frame = oriented(original, self.rotation)
+        self.lane.overlay.blend_native(frame, masks, self.hlg)
+        check_cancel(self.cancel)
+        if self.pixel_format:
+            frame = frame.reformat(format=self.pixel_format)
+        return frame
+
+
+def composited_packets(source, video, analysis, revealed, manual, composite, cancel):
+    """Parallelize composition, keeping all video/audio events in demux order."""
+    pending = deque()
+    executor = ThreadPoolExecutor(max_workers=EXPORT_WORKERS, thread_name_prefix="composite")
+    count = 0
+    try:
+        for packet in source.demux():
+            check_cancel(cancel)
+            if packet.stream.index == video.index:
+                for original in packet.decode():
+                    if (
+                        original.pts is None
+                        or count >= len(analysis.frames)
+                        or abs(float(original.pts * original.time_base) - analysis.times[count])
+                        > 1e-6
+                    ):
+                        raise UserError(
+                            "解析時と動画のフレームが一致しません。再解析してください。"
+                        )
+                    # Decoder reference buffers must stay immutable. FFmpeg copies
+                    # shared buffers here, before any worker can change the pixels.
+                    original.make_writable()
+                    masks = hidden_faces(analysis.frames[count], revealed) + manual
+                    pending.append((True, executor.submit(composite, original, masks)))
+                    count += 1
+                    if len(pending) >= EXPORT_PENDING:
+                        is_video, value = pending.popleft()
+                        yield is_video, value.result() if is_video else value
+            elif packet.stream.type == "audio" and packet.dts is not None:
+                pending.append((False, packet))
+                if len(pending) >= EXPORT_PENDING:
+                    is_video, value = pending.popleft()
+                    yield is_video, value.result() if is_video else value
+        if count != len(analysis.frames):
+            raise UserError("動画の終端が解析時と一致しません。")
+        while pending:
+            check_cancel(cancel)
+            is_video, value = pending.popleft()
+            yield is_video, value.result() if is_video else value
+    finally:
+        for is_video, value in pending:
+            if is_video:
+                value.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def public_bitrate(analysis, info):
+    # Hardware bitrate control differs from x264 CRF. Keep a generous floor and
+    # never request less than the source bitrate; MP4 remains a lossy delivery format.
+    return max(
+        int(info.get("bit_rate", 0)),
+        int(analysis.width * analysis.height * analysis.fps * (0.15 if analysis.hlg else 0.3)),
+        4_000_000,
+    )
+
+
+def mp4_codec(analysis, info):
+    if analysis.hlg:
+        return "hevc_videotoolbox"
+    if sys.platform == "darwin" and "h264_videotoolbox" in av.codecs_available:
+        # Fail over before producing any frames or opening the output container.
+        context = av.CodecContext.create("h264_videotoolbox", "w")
+        context.width, context.height = analysis.width, analysis.height
+        context.pix_fmt = "yuv420p"
+        context.time_base = Fraction(1, max(1, round(analysis.fps)))
+        context.bit_rate = public_bitrate(analysis, info)
+        context.options = {"profile": "high", "allow_sw": "0"}
+        try:
+            context.open()
+            return "h264_videotoolbox"
+        except av.error.FFmpegError:
+            pass
+        finally:
+            # PyAV has no CodecContext.close(); releasing its last reference
+            # destroys the temporary hardware session before actual encoding.
+            del context
+    return "libx264"
+
+
 def export(
     analysis: Analysis,
     output: Path,
@@ -381,11 +485,14 @@ def export(
         )
     if digest(analysis.path) != analysis.fingerprint:
         raise UserError("解析後に元動画が変更されました。もう一度解析してください。")
+    check_cancel(cancel)
     info = probe(analysis.path)
-    direct_mp4 = mp4 and all(codec in {"aac", "alac", "mp3"} for codec in info["audio_codecs"])
+    copy_audio = all(codec in {"aac", "alac", "mp3"} for codec in info["audio_codecs"])
+    transcode_audio = mp4 and not copy_audio
+    codec = mp4_codec(analysis, info) if mp4 else "ffv1"
     # Temporary media is private and is deleted on failure/cancellation.
     with tempfile.TemporaryDirectory(prefix=".people-mosaic-", dir=output.parent) as directory:
-        master = Path(directory) / ("public.mp4" if direct_mp4 else "master.mkv")
+        master = Path(directory) / ("video.mp4" if mp4 else "master.mkv")
         with (
             av.open(str(analysis.path)) as source,
             av.open(
@@ -393,144 +500,108 @@ def export(
                 "w",
                 options=(
                     {"movflags": "+faststart", "avoid_negative_ts": "disabled"}
-                    if direct_mp4
+                    if mp4 and not transcode_audio
                     else {"avoid_negative_ts": "disabled"}
                 ),
             ) as dest,
         ):
             original_video = source.streams.video[0]
-            codec = "ffv1"
-            if direct_mp4:
-                codec = "hevc_videotoolbox" if analysis.hlg else "libx264"
+            # Software decoding retains exact native samples for lossless export.
+            original_video.thread_type = "AUTO"
+            original_video.codec_context.thread_count = 2
             video = dest.add_stream(
                 codec, rate=original_video.base_rate or original_video.average_rate or 30
             )
             video.width, video.height = analysis.width, analysis.height
-            video.pix_fmt = (
-                ("p010le" if analysis.hlg else "yuv420p") if direct_mp4 else info["pix_fmt"]
-            )
+            video.pix_fmt = ("p010le" if analysis.hlg else "yuv420p") if mp4 else info["pix_fmt"]
             video.time_base = original_video.time_base
             video.codec_context.time_base = original_video.time_base
             video.codec_context.color_range = original_video.codec_context.color_range
             video.codec_context.colorspace = original_video.codec_context.colorspace
             video.codec_context.color_primaries = original_video.codec_context.color_primaries
             video.codec_context.color_trc = original_video.codec_context.color_trc
-            if direct_mp4 and analysis.hlg:
-                video.bit_rate = max(
-                    int(info.get("bit_rate", 0)),
-                    int(analysis.width * analysis.height * analysis.fps * 0.15),
-                )
-                video.options = {"profile": "main10"}
-                video.codec_context.codec_tag = "hvc1"
-            elif direct_mp4:
+            if mp4 and "videotoolbox" in codec:
+                video.bit_rate = public_bitrate(analysis, info)
+                video.options = {"profile": "main10" if analysis.hlg else "high", "allow_sw": "0"}
+                if analysis.hlg:
+                    video.codec_context.codec_tag = "hvc1"
+            elif mp4:
                 video.options = {"crf": "16", "preset": "medium"}
+                video.codec_context.thread_count = 4
             else:
-                video.options = {"level": "3", "slicecrc": "1"}
-            audio_map = {
-                stream.index: dest.add_stream_from_template(stream)
-                for stream in source.streams.audio
-            }
+                video.options = {"level": "3", "slicecrc": "1", "slices": "16"}
+                video.codec_context.thread_count = 8
+            audio_map = (
+                {}
+                if transcode_audio
+                else {
+                    stream.index: dest.add_stream_from_template(stream)
+                    for stream in source.streams.audio
+                }
+            )
+            composite = FrameCompositor(
+                rgba, info["rotation"], analysis.hlg, video.pix_fmt if mp4 else None, cancel
+            )
             count = 0
-            for packet in source.demux():
-                check_cancel(cancel)
-                if packet.stream.index in audio_map:
-                    if packet.dts is not None:
-                        packet.stream = audio_map[packet.stream.index]
-                        dest.mux(packet)
-                elif packet.stream.index == original_video.index:
-                    for original in packet.decode():
-                        if (
-                            count >= len(analysis.frames)
-                            or abs(float(original.pts * original.time_base) - analysis.times[count])
-                            > 1e-6
-                        ):
-                            raise UserError(
-                                "解析時と動画のフレームが一致しません。再解析してください。"
-                            )
-                        frame = oriented(original, info["rotation"])
-                        masks = hidden_faces(analysis.frames[count], revealed) + manual
-                        blend_native(frame, masks, rgba, analysis.hlg)
-                        if direct_mp4:
-                            frame = frame.reformat(format=video.pix_fmt)
-                        for encoded in video.encode(frame):
+            with closing(
+                composited_packets(
+                    source, original_video, analysis, revealed, manual, composite, cancel
+                )
+            ) as events:
+                for is_video, value in events:
+                    check_cancel(cancel)
+                    if is_video:
+                        for encoded in video.encode(value):
                             dest.mux(encoded)
                         count += 1
                         if count % 8 == 0:
                             progress(
-                                int(
-                                    count
-                                    / len(analysis.frames)
-                                    * (65 if mp4 and not direct_mp4 else 95)
-                                ),
+                                int(count / len(analysis.frames) * (85 if transcode_audio else 95)),
                                 f"雲を合成中 · {count:,} / {len(analysis.frames):,}",
                             )
-            if count != len(analysis.frames):
-                raise UserError("動画の終端が解析時と一致しません。")
+                    elif value.stream.index in audio_map:
+                        value.stream = audio_map[value.stream.index]
+                        dest.mux(value)
             for encoded in video.encode():
                 dest.mux(encoded)
         check_cancel(cancel)
         final = master
-        if mp4 and not direct_mp4:
-            progress(70, "公開用 MP4 を作成中")
+        if transcode_audio:
+            progress(90, "MP4 の音声を変換中")
             final = Path(directory) / "public.mp4"
+            # Encode video only once, retaining fine-grained MP4 timestamps.
+            # Read original audio with its original timeline, converting only audio.
             command = [
                 shutil.which("ffmpeg") or "ffmpeg",
                 "-nostdin",
                 "-hide_banner",
                 "-loglevel",
                 "error",
+                "-copyts",
                 "-i",
                 str(master),
+                "-i",
+                str(analysis.path),
                 "-map",
                 "0:v:0",
                 "-map",
-                "0:a?",
+                "1:a?",
                 "-map_metadata",
                 "-1",
                 "-c:v",
-                "libx264",
-                "-crf",
-                "16",
-                "-preset",
-                "slow",
-                "-pix_fmt",
-                "yuv420p",
+                "copy",
                 "-fps_mode",
                 "passthrough",
                 "-c:a",
                 "aac",
                 "-b:a",
                 "256k",
+                "-avoid_negative_ts",
+                "disabled",
                 "-movflags",
                 "+faststart",
                 str(final),
             ]
-            if analysis.hlg:
-                video_index = command.index("-c:v")
-                pixel_index = command.index("-fps_mode")
-                command[video_index:pixel_index] = [
-                    "-c:v",
-                    "hevc_videotoolbox",
-                    "-profile:v",
-                    "main10",
-                    "-pix_fmt",
-                    "p010le",
-                    "-b:v",
-                    str(
-                        max(
-                            int(info.get("bit_rate", 0)),
-                            int(analysis.width * analysis.height * analysis.fps * 0.15),
-                        )
-                    ),
-                    "-tag:v",
-                    "hvc1",
-                    "-color_primaries",
-                    "bt2020",
-                    "-color_trc",
-                    "arib-std-b67",
-                    "-colorspace",
-                    "bt2020nc",
-                ]
             with tempfile.TemporaryFile() as errors:
                 process = subprocess.Popen(command, stderr=errors, stdout=subprocess.DEVNULL)
                 try:
