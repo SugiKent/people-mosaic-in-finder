@@ -23,6 +23,7 @@ from .domain import CLUSTER_THRESHOLD, Analysis, Face, Person, hidden_faces, ide
 from .errors import UserError
 from .models import digest, model_paths
 from .overlay import SUPPORTED, PreparedOverlay, native_plane
+from .stabilize import stabilize_faces
 
 
 class Cancelled(Exception):
@@ -280,6 +281,7 @@ def analyze(
     )
     previous_gray = None
     held: list[tuple[Face, float]] = []
+    cut_frames = set()
     with analysis_decoder(path, hardware) as (stream, decoded):
         fps = float(stream.average_rate or stream.base_rate or 30)
         duration = float(stream.duration * stream.time_base) if stream.duration else 0
@@ -313,7 +315,12 @@ def analyze(
                     faces.append(face)
                 # Tracking never grants an exemption. A missed/reacquired face is hidden.
                 next_held = [(face, timestamp) for face in faces]
-                if previous_gray is not None and np.mean(cv2.absdiff(gray, previous_gray)) < 45:
+                scene_cut = (
+                    previous_gray is not None and np.mean(cv2.absdiff(gray, previous_gray)) >= 45
+                )
+                if scene_cut:
+                    cut_frames.add(index)
+                if previous_gray is not None and not scene_cut:
                     eligible = [
                         (face, last_seen)
                         for face, last_seen in held
@@ -348,6 +355,9 @@ def analyze(
             if face.person is not None and ids.count(face.person) > 1:
                 face.confident = False
             face.feature = None
+    check_cancel(cancel)
+    analysis.frames = stabilize_faces(analysis.frames, analysis.times, cut_frames)
+    check_cancel(cancel)
     if digest(path) != fingerprint:
         raise UserError("解析中に元動画が変更されました。もう一度選んでください。")
     return analysis
