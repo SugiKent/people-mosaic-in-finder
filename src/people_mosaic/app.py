@@ -8,17 +8,14 @@ from threading import Event
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QRectF, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -33,6 +30,7 @@ from . import engine
 from .domain import Face, hidden_faces
 from .errors import UserError
 from .overlay import blend_bgr, cloud, load_png
+from .people_picker import PeoplePicker
 
 
 def pixmap(bgr: np.ndarray) -> QPixmap:
@@ -148,13 +146,13 @@ class Window(QMainWindow):
         self.preview_index = -1
         self.play_start = None
         self.setWindowTitle("People Mosaic · 雲で顔を隠す")
-        self.resize(1180, 830)
+        self.resize(1280, 880)
         self.setAcceptDrops(True)
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(28, 24, 28, 24)
-        layout.setSpacing(14)
+        layout.setSpacing(9)
         heading = QLabel("People Mosaic")
         heading.setObjectName("heading")
         layout.addWidget(heading)
@@ -183,18 +181,23 @@ class Window(QMainWindow):
         split.addWidget(self.canvas)
         people_panel = QWidget()
         people_layout = QVBoxLayout(people_panel)
-        people_layout.addWidget(QLabel("雲を付けない人物候補"))
-        note = QLabel("チェックした候補だけ顔を表示します。\n似ているか曖昧なフレームは隠します。")
+        people_top = QHBoxLayout()
+        people_top.addWidget(QLabel("雲を付けない人物候補"), 1)
+        self.overview_button = QPushButton("大きな一覧で選ぶ")
+        self.overview_button.clicked.connect(self.show_people_overview)
+        people_top.addWidget(self.overview_button)
+        people_layout.addLayout(people_top)
+        note = QLabel("チェックで雲を外します。顔写真をクリックすると登場位置へ移動します。")
         note.setWordWrap(True)
         people_layout.addWidget(note)
-        self.people = QListWidget()
-        self.people.setIconSize(QSize(64, 64))
-        self.people.setMinimumWidth(285)
-        self.people.setAccessibleName("雲を付けない人物候補。初期状態は全員を隠します")
-        self.people.itemChanged.connect(self.repaint_preview)
-        self.people.itemClicked.connect(self.jump_to_person)
-        people_layout.addWidget(self.people)
-        self.summary = QLabel("解析すると候補がここに表示されます")
+        self.people = PeoplePicker()
+        self.people.setMinimumWidth(330)
+        self.people.selection_changed.connect(self.repaint_preview)
+        self.people.candidate_clicked.connect(self.jump_to_person)
+        people_layout.addWidget(self.people, 1)
+        self.summary = QLabel(
+            "同じ人が複数候補に分かれる場合があります。\n似ているか曖昧なフレームは隠します。"
+        )
         self.summary.setWordWrap(True)
         people_layout.addWidget(self.summary)
         reset = QPushButton("全員を隠す")
@@ -202,8 +205,9 @@ class Window(QMainWindow):
         people_layout.addWidget(reset)
         self.reset_button = reset
         split.addWidget(people_panel)
-        split.setStretchFactor(0, 4)
-        split.setStretchFactor(1, 1)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([700, 490])
         layout.addWidget(split, 1)
         scrub = QHBoxLayout()
         self.play = QPushButton("再生")
@@ -244,9 +248,6 @@ class Window(QMainWindow):
         self.region_note = QLabel("ドラッグで追加 · 動画全体の同じ位置を隠します")
         region_row.addWidget(self.region_note, 1)
         layout.addLayout(region_row)
-        self.review = QCheckBox("加工後の動画を確認しました（小さい顔・横顔・検出漏れも確認）")
-        self.review.toggled.connect(self.refresh_export)
-        layout.addWidget(self.review)
         output_row = QHBoxLayout()
         self.format = QComboBox()
         self.format.addItems(["公開用 MP4 · 高画質", "保存用 MKV · 可逆圧縮"])
@@ -289,6 +290,7 @@ class Window(QMainWindow):
         self.analysis_mode.setEnabled(not busy)
         for widget in (
             self.people,
+            self.overview_button,
             self.reset_button,
             self.slider,
             self.png,
@@ -296,7 +298,6 @@ class Window(QMainWindow):
             self.region_button,
             self.undo,
             self.play,
-            self.review,
             self.format,
         ):
             widget.setEnabled(ready)
@@ -304,9 +305,7 @@ class Window(QMainWindow):
         self.refresh_export()
 
     def refresh_export(self):
-        self.export_button.setEnabled(
-            self.analysis is not None and self.review.isChecked() and not self.busy()
-        )
+        self.export_button.setEnabled(self.analysis is not None and not self.busy())
 
     def choose_video(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -331,12 +330,11 @@ class Window(QMainWindow):
         self.analysis = None
         self.format_changed()
         self.manual.clear()
-        self.people.clear()
+        self.people.set_candidates([])
         self.canvas.image = None
         self.canvas.update()
         self.preview_raw = None
         self.preview_index = -1
-        self.review.setChecked(False)
         self.filename.setText(path.name)
         self.setWindowTitle(f"People Mosaic · {path.name}")
         self.region_note.setText("ドラッグで追加 · 動画全体の同じ位置を隠します")
@@ -367,24 +365,17 @@ class Window(QMainWindow):
 
     def analyzed(self, result):
         self.analysis = result
-        self.people.blockSignals(True)
-        for index, person in enumerate(result.people):
-            first = result.times[person.first_frame] - result.times[0]
-            item = QListWidgetItem(
-                QIcon(pixmap(person.thumbnail)),
-                f"人物候補 {index + 1}\n最初の登場 {self.clock(first)}",
+        self.people.set_candidates(
+            (
+                index,
+                pixmap(person.thumbnail),
+                result.times[person.first_frame] - result.times[0],
+                person.count,
             )
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Unchecked)
-            item.setData(Qt.ItemDataRole.UserRole, index)
-            item.setSizeHint(QSize(250, 82))
-            self.people.addItem(item)
-        self.people.blockSignals(False)
+            for index, person in enumerate(result.people)
+        )
         self.slider.setRange(0, len(result.frames) - 1)
         self.slider.setValue(0)
-        self.summary.setText(
-            f"{len(result.people)} 候補 · 全員を隠しています\n同じ人が複数候補に分かれる場合があります。"
-        )
         self.status.setText(
             "解析が完了しました。検出漏れは「隠す範囲を追加」で補ってください。"
             if result.people
@@ -399,11 +390,7 @@ class Window(QMainWindow):
         return f"{int(seconds) // 60}:{int(seconds) % 60:02d}"
 
     def revealed(self):
-        return {
-            self.people.item(i).data(Qt.ItemDataRole.UserRole)
-            for i in range(self.people.count())
-            if self.people.item(i).checkState() == Qt.CheckState.Checked
-        }
+        return self.people.revealed()
 
     def schedule_preview(self):
         if self.analysis:
@@ -417,18 +404,15 @@ class Window(QMainWindow):
             if index != self.preview_index:
                 self.preview_raw = engine.preview_frame(self.analysis, index)
                 self.preview_index = index
-            self.repaint_preview(invalidate=False)
+            self.repaint_preview()
             relative = self.analysis.times[index] - self.analysis.times[0]
             total = self.analysis.times[-1] - self.analysis.times[0]
             self.time_label.setText(f"{self.clock(relative)} / {self.clock(total)}")
         except Exception:
             self.stop_play()
             self.status.setText("プレビューを読み込めませんでした。動画を再選択してください。")
-            self.review.setChecked(False)
 
-    def repaint_preview(self, *args, invalidate=True):
-        if invalidate:
-            self.review.setChecked(False)
+    def repaint_preview(self, *args):
         if self.analysis is None or self.preview_raw is None:
             return
         faces = (
@@ -436,19 +420,18 @@ class Window(QMainWindow):
         )
         self.canvas.image = pixmap(blend_bgr(self.preview_raw, faces, self.rgba))
         self.canvas.update()
-        self.summary.setText(
-            f"{len(self.analysis.people)} 候補 · {len(self.revealed())} 候補を表示\n同じ人が複数候補に分かれる場合があります。"
-        )
 
-    def jump_to_person(self, item):
+    def jump_to_person(self, person):
         if self.analysis:
-            self.slider.setValue(
-                self.analysis.people[item.data(Qt.ItemDataRole.UserRole)].first_frame
-            )
+            self.slider.setValue(self.analysis.people[person].first_frame)
+
+    def show_people_overview(self):
+        if self.analysis and not self.busy():
+            self.stop_play()
+            self.people.show_overview()
 
     def hide_everyone(self):
-        for index in range(self.people.count()):
-            self.people.item(index).setCheckState(Qt.CheckState.Unchecked)
+        self.people.hide_everyone()
 
     def choose_png(self):
         path, _ = QFileDialog.getOpenFileName(self, "顔に重ねる透過 PNG を選ぶ", "", "PNG (*.png)")
@@ -527,7 +510,7 @@ class Window(QMainWindow):
         self.play.setText("再生")
 
     def write_video(self):
-        if not self.analysis or self.busy() or not self.review.isChecked():
+        if not self.analysis or self.busy():
             return
         mp4 = self.format.currentIndex() == 0
         extension = ".mp4" if mp4 else ".mkv"
@@ -556,7 +539,6 @@ class Window(QMainWindow):
     def failed(self, message):
         self.status.setText(message)
         self.progress.setValue(0)
-        self.review.setChecked(False)
 
     def cancel_work(self):
         if self.busy():
@@ -594,9 +576,8 @@ QPushButton:checked { background: #d2eddf; }
 QPushButton:disabled { color: #99a8a1; background: #eef1ee; }
 QPushButton#primary { background: #216950; color: white; border: none; font-weight: 600; }
 QPushButton#primary:disabled { background: #b7ccc1; }
-QListWidget { background: #ffffff; border: 1px solid #d5dfd8; border-radius: 10px; padding: 5px; }
-QListWidget::item { padding: 6px; border-bottom: 1px solid #eef1ee; }
-QListWidget::item:selected { background: #e0f0e7; color: #1d3237; }
+QDialog { background: #f4f6f3; }
+QListView { background: #f4f6f3; border: 1px solid #d5dfd8; border-radius: 10px; padding: 5px; }
 QComboBox { padding: 8px; background: white; border: 1px solid #cbd7d0; border-radius: 8px; }
 QProgressBar { border: none; border-radius: 5px; background: #e1e8e2; height: 12px; text-align: center; }
 QProgressBar::chunk { background: #76b49b; border-radius: 5px; }
