@@ -40,9 +40,9 @@ def test_deliberate_movement_follows_quickly_and_never_leaves_face_uncovered():
     result = stabilize_faces(frames, [i / 60 for i in range(60)])
     for raw, stable in zip(frames, result, strict=True):
         assert_contains(stable[0], raw[0])
-        assert np.linalg.norm(centre(stable[0]) - centre(raw[0])) <= 9.01
-        assert stable[0].box[2] <= raw[0].box[2] * 1.3 + 1e-8
-    assert centre(result[-1][0])[0] - centre(result[0][0])[0] > 580
+        assert np.linalg.norm(centre(stable[0]) - centre(raw[0])) <= 15.01
+        assert stable[0].box[2] <= raw[0].box[2] * 1.5 + 1e-8
+    assert centre(result[-1][0])[0] - centre(result[0][0])[0] > 570
 
 
 @pytest.mark.parametrize("person", [None, 7])
@@ -110,7 +110,7 @@ def test_cuts_missing_faces_large_jumps_and_gaps_reset_without_trails(reset):
 
 
 def test_smoothing_uses_elapsed_time_for_vfr_not_frame_count():
-    frames = [[Face((100, 80, 100, 100))], [Face((110, 80, 100, 100))]]
+    frames = [[Face((100, 80, 100, 100))], [Face((120, 80, 100, 100))]]
     short = stabilize_faces(frames, [0, 1 / 120])
     long = stabilize_faces(frames, [0, 0.1])
     assert centre(long[1][0])[0] > centre(short[1][0])[0]
@@ -122,9 +122,11 @@ def test_size_shrinks_gradually_after_actual_zoom_change():
     frames = [[Face((100, 100, 100, 100))]] + [[Face((110, 110, 80, 80))] for _ in range(90)]
     result = stabilize_faces(frames, [i / 60 for i in range(len(frames))])
     sizes = [frame[0].box[2] for frame in result]
-    assert 80 < sizes[1] < sizes[0]
+    assert sizes[1] == sizes[0]
+    assert sizes[30] == sizes[0]
+    assert sizes[50] < sizes[0]
     assert all(a >= b for a, b in zip(sizes, sizes[1:]))
-    assert sizes[-1] < 96
+    assert sizes[-1] < 105
     for raw, stable in zip(frames, result, strict=True):
         assert_contains(stable[0], raw[0])
 
@@ -152,10 +154,97 @@ def test_real_cloud_placement_footprint_stops_breathing_for_small_face_jitter():
 def test_tiny_faces_and_a_stale_large_detection_keep_bounded_padding():
     for size in (8, 20, 40, 100):
         frames = [[Face((100, 100, size, size))]] + [
-            [Face((100 + i % 4, 100 + i % 3, size * 0.65, size * 0.65))] for i in range(20)
+            [Face((100 + i % 4, 100 + i % 3, size * 0.65, size * 0.65))] for i in range(80)
         ]
         result = stabilize_faces(frames, [i / 60 for i in range(len(frames))])
         for raw, stable in zip(frames, result, strict=True):
             assert_contains(stable[0], raw[0])
-            assert stable[0].box[2] <= raw[0].box[2] * 1.3 + 1e-8
-            assert stable[0].box[3] <= raw[0].box[3] * 1.3 + 1e-8
+            assert stable[0].box[2] <= size * 1.5 + 1e-8
+            assert stable[0].box[3] <= size * 1.5 + 1e-8
+        assert result[-1][0].box[2] <= frames[-1][0].box[2] * 1.5 + 1e-8
+        assert result[-1][0].box[3] <= frames[-1][0].box[3] * 1.5 + 1e-8
+
+
+def test_twelve_pixel_detection_change_on_eighty_pixel_face_is_now_held():
+    # This motion crossed the previous 8% / 3px deadband. A cloud can now stay
+    # still while a detector shifts moderately, still fully covering its face.
+    frames = [[Face((100, 100, 80, 80))], [Face((112, 100, 80, 80))]]
+    result = stabilize_faces(frames, [0, 1 / 60])
+    assert np.allclose(centre(result[1][0]), centre(result[0][0]))
+    assert_contains(result[1][0], frames[1][0])
+
+
+@pytest.mark.parametrize("size,jitter", [(50, 4), (80, 6), (100, 6)])
+def test_moderate_position_and_dimensions_jitter_keep_cloud_footprint_steady(size, jitter):
+    from people_mosaic.overlay import PreparedOverlay, cloud
+
+    frames = []
+    for i in range(180):
+        delta = jitter if i % 2 else -jitter
+        width, height = size + (i % 3 - 1) * 3, size + (i % 4 - 2) * 2
+        frames.append([Face((200 + delta - width / 2, 200 - delta - height / 2, width, height))])
+    result = stabilize_faces(frames, [i / 60 for i in range(len(frames))])
+    overlay = PreparedOverlay(cloud())
+
+    def footprint(face):
+        x, y, patch = overlay.placement(face.box, 640, 480)
+        return [x, y, patch.shape[1], patch.shape[0]]
+
+    raw = np.array([footprint(frame[0]) for frame in frames])
+    stable = np.array([footprint(frame[0]) for frame in result])
+    assert (
+        np.abs(np.diff(stable[60:], axis=0)).sum() < np.abs(np.diff(raw[60:], axis=0)).sum() * 0.1
+    )
+    for raw_frame, stable_frame in zip(frames, result, strict=True):
+        assert_contains(stable_frame[0], raw_frame[0])
+
+
+@pytest.mark.parametrize("size,jitter", [(50, 4), (80, 6), (100, 6)])
+def test_short_period_dimensions_alone_do_not_make_cloud_breathe(size, jitter):
+    from people_mosaic.overlay import PreparedOverlay, cloud
+
+    frames = []
+    for i in range(180):
+        dimension = size + (jitter if i % 2 else -jitter)
+        frames.append([Face((200 - dimension / 2, 200 - dimension / 2, dimension, dimension))])
+    result = stabilize_faces(frames, [i / 60 for i in range(len(frames))])
+    overlay = PreparedOverlay(cloud())
+    shapes = [overlay.placement(frame[0].box, 640, 480)[2].shape for frame in result]
+    assert len(set(shapes[30:])) == 1
+    for raw, stable in zip(frames, result, strict=True):
+        assert_contains(stable[0], raw[0])
+
+
+def test_continuous_shrink_wait_is_based_on_elapsed_time_in_vfr():
+    frames = [[Face((100, 100, 100, 100))]] + [Face((110, 110, 80, 80)) for _ in range(6)]
+    frames = [frame if isinstance(frame, list) else [frame] for frame in frames]
+    times = [0, 0.1, 0.25, 0.4, 0.55, 0.69, 0.72]
+    result = stabilize_faces(frames, times)
+    sizes = [frame[0].box[2] for frame in result]
+    # The rolling bound may tighten after 0.6 seconds, but shrink must not
+    # commence just because a small number of VFR frames were observed.
+    assert sizes[:6] == [sizes[0]] * 6
+    assert sizes[-1] < sizes[0]
+    assert sizes[-1] >= frames[-1][0].box[2]
+    for raw, stable in zip(frames, result, strict=True):
+        assert_contains(stable[0], raw[0])
+
+
+def test_short_dimension_jitter_near_the_size_cap_does_not_force_shrink_each_frame():
+    from people_mosaic.overlay import PreparedOverlay, cloud
+
+    frames = []
+    for i in range(120):
+        size = 100 + (6 if i % 2 else -6)
+        # Sustained movement brings the covering box near its size cap. The
+        # fluctuating current detection must not repeatedly lower that cap.
+        cx = 400 + i * 12
+        frames.append([Face((cx - size / 2, 200 - size / 2, size, size))])
+    result = stabilize_faces(frames, [i / 60 for i in range(len(frames))])
+    overlay = PreparedOverlay(cloud())
+    shapes = [overlay.placement(frame[0].box, 2400, 480)[2].shape for frame in result]
+    assert len(set(shapes[40:])) == 1
+    for raw, stable in zip(frames, result, strict=True):
+        assert_contains(stable[0], raw[0])
+        assert stable[0].box[2] <= 106 * 1.5 + 1e-8
+    assert centre(result[-1][0])[0] - centre(result[0][0])[0] > 1390

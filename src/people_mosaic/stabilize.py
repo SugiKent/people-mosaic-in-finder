@@ -6,9 +6,11 @@ from dataclasses import dataclass, replace
 
 from .domain import Face
 
-POSITION_TAU = 0.14
-SHRINK_TAU = 0.28
+POSITION_TAU = 0.25
+SHRINK_TAU = 0.45
 MAX_GAP = 0.25
+SHRINK_HOLD = 0.6
+SIZE_WINDOW = 0.6
 
 
 @dataclass
@@ -18,6 +20,8 @@ class _Track:
     size: tuple[float, float]
     time: float
     person: int | None
+    small_since: tuple[float | None, float | None] = (None, None)
+    size_history: tuple[tuple[float, float, float], ...] = ()
 
 
 def _centre(box):
@@ -66,52 +70,72 @@ def _advance(face, timestamp, track):
     raw_centre = _centre(face.box)
     raw_size = face.box[2:]
     if track is None:
-        width, height = (dimension * 1.08 for dimension in raw_size)
+        width, height = (dimension * 1.15 for dimension in raw_size)
         box = (raw_centre[0] - width / 2, raw_centre[1] - height / 2, width, height)
         return replace(face, box=box), _Track(
-            face.box, raw_centre, (width, height), timestamp, face.person
+            face.box,
+            raw_centre,
+            (width, height),
+            timestamp,
+            face.person,
+            size_history=((timestamp, *raw_size),),
         )
     dt = timestamp - track.time
-    deadband = max(3.0, min(12.0, min(raw_size) * 0.08))
+    deadband = max(6.0, min(24.0, min(raw_size) * 0.15))
     distance = math.dist(raw_centre, track.centre)
-    alpha = -math.expm1(-dt / POSITION_TAU)
-    # Follow deliberate movement rapidly so smoothing does not create a large
-    # trailing cloud. Tiny changes hold still; moderate changes use time-based EMA.
-    if distance > min(raw_size) * 0.35:
-        alpha = 1.0
-    elif distance > min(raw_size) * 0.24:
-        alpha = max(alpha, 0.65)
+    # Adapt continuously to large movement. Discrete "smooth/fast/snap"
+    # thresholds can alternate across adjacent frames and add visible jitter.
+    relative_motion = distance / min(raw_size)
+    alpha = -math.expm1(-dt / POSITION_TAU * (1 + 20 * relative_motion**2))
     centre = tuple(
         previous if abs(current - previous) <= deadband else previous + alpha * (current - previous)
         for previous, current in zip(track.centre, raw_centre, strict=True)
     )
+    history = tuple(record for record in track.size_history if timestamp - record[0] <= SIZE_WINDOW)
+    history += ((timestamp, *raw_size),)
+    recent_max = (max(record[1] for record in history), max(record[2] for record in history))
     # Bound lag before sizing: a wider static deadband must not make a cloud
     # grow without limit or fail to cover a small fast-moving face.
     centre = tuple(
-        current - max(-dimension * 0.15, min(dimension * 0.15, current - stable))
-        for current, stable, dimension in zip(raw_centre, centre, raw_size, strict=True)
+        current - max(-dimension * 0.25, min(dimension * 0.25, current - stable))
+        for current, stable, dimension in zip(raw_centre, centre, recent_max, strict=True)
     )
     shrink = -math.expm1(-dt / SHRINK_TAU)
-    size = []
-    for previous, current, raw_position, stable_position in zip(
-        track.size, raw_size, raw_centre, centre, strict=True
+    size, small_since = [], []
+    for dimension, (previous, current, raw_position, stable_position) in enumerate(
+        zip(track.size, raw_size, raw_centre, centre, strict=True)
     ):
         # A box centred at the filtered position must contain the whole raw
         # box. Its opaque PNG core therefore continues to cover the real face.
-        required = max(current * 1.08, current + 2 * abs(raw_position - stable_position))
+        required = max(current * 1.15, current + 2 * abs(raw_position - stable_position))
+        since = None
         if required >= previous:
             value = required
-        elif previous - required <= max(3.0, previous * 0.08):
+        elif previous - required <= max(5.0, previous * 0.12):
             value = previous
         else:
-            value = max(required, previous + shrink * (required - previous))
-        # A stale large detection must not keep an oversized cloud after a
-        # face becomes smaller. Preserve the required coverage at every size.
-        size.append(min(value, max(required, current * 1.3)))
+            since = track.small_since[dimension]
+            since = timestamp if since is None else since
+            value = previous
+            if timestamp - since >= SHRINK_HOLD:
+                value = max(required, previous + shrink * (required - previous))
+        # A rolling upper bound cannot echo each raw size fluctuation back into
+        # the cloud. A genuinely smaller face still releases the old bound in
+        # 0.6 seconds, preventing indefinitely oversized masks.
+        size.append(min(value, max(required, recent_max[dimension] * 1.5)))
+        small_since.append(since)
     width, height = size
     box = (centre[0] - width / 2, centre[1] - height / 2, width, height)
     stable = replace(face, box=box)
-    return stable, _Track(face.box, centre, (width, height), timestamp, face.person)
+    return stable, _Track(
+        face.box,
+        centre,
+        (width, height),
+        timestamp,
+        face.person,
+        tuple(small_since),
+        history,
+    )
 
 
 def stabilize_faces(
