@@ -9,6 +9,7 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from fractions import Fraction
+from heapq import merge
 from itertools import chain
 from pathlib import Path
 from threading import Event, local
@@ -477,6 +478,43 @@ def mp4_codec(analysis, info):
     return "libx264"
 
 
+def remux_public_mp4(video_path: Path, audio_path: Path, output: Path, cancel: Event) -> None:
+    """Copy encoded video/audio packets without CLI duration inference.
+
+    In particular, FFmpeg 6's CLI can recalculate the final VFR video duration
+    during stream copy. PyAV muxes the explicit packet durations from our master.
+    Only one packet per input is prefetched; encoded video is never decoded again.
+    """
+    with (
+        av.open(str(video_path)) as video,
+        av.open(str(audio_path)) as audio,
+        av.open(
+            str(output),
+            "w",
+            options={"movflags": "+faststart", "avoid_negative_ts": "disabled"},
+        ) as dest,
+    ):
+        streams = {}
+        for source in (video, audio):
+            for stream in source.streams:
+                target = dest.add_stream_from_template(stream)
+                target.metadata.clear()
+                streams[(id(source), stream.index)] = target
+
+        def packets(source):
+            for packet in source.demux():
+                check_cancel(cancel)
+                if packet.dts is not None:
+                    yield source, packet
+
+        for source, packet in merge(
+            packets(video), packets(audio), key=lambda event: event[1].dts * event[1].time_base
+        ):
+            check_cancel(cancel)
+            packet.stream = streams[(id(source), packet.stream.index)]
+            dest.mux(packet)
+
+
 def export(
     analysis: Analysis,
     output: Path,
@@ -579,8 +617,9 @@ def export(
         if transcode_audio:
             progress(90, "MP4 の音声を変換中")
             final = Path(directory) / "public.mp4"
-            # Encode video only once, retaining fine-grained MP4 timestamps.
-            # Read original audio with its original timeline, converting only audio.
+            # Convert audio only. A separate PyAV packet mux preserves the
+            # masked video timeline even with older system FFmpeg versions.
+            audio_only = Path(directory) / "audio.m4a"
             command = [
                 shutil.which("ffmpeg") or "ffmpeg",
                 "-nostdin",
@@ -589,19 +628,12 @@ def export(
                 "error",
                 "-copyts",
                 "-i",
-                str(master),
-                "-i",
                 str(analysis.path),
                 "-map",
-                "0:v:0",
-                "-map",
-                "1:a?",
+                "0:a",
                 "-map_metadata",
                 "-1",
-                "-c:v",
-                "copy",
-                "-fps_mode",
-                "passthrough",
+                "-vn",
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -610,7 +642,7 @@ def export(
                 "disabled",
                 "-movflags",
                 "+faststart",
-                str(final),
+                str(audio_only),
             ]
             with tempfile.TemporaryFile() as errors:
                 process = subprocess.Popen(command, stderr=errors, stdout=subprocess.DEVNULL)
@@ -634,6 +666,7 @@ def export(
                         except subprocess.TimeoutExpired:
                             process.kill()
                             process.wait()
+            remux_public_mp4(master, audio_only, final, cancel)
         check_cancel(cancel)
         if digest(analysis.path) != analysis.fingerprint:
             raise UserError("書き出し中に元動画が変更されました。出力を破棄しました。")

@@ -137,7 +137,34 @@ def test_interframe_vfr_export_pixels_audio_offsets_and_duration(tmp_path, mp4, 
     )
     output = tmp_path / ("result.mp4" if mp4 else "result.mkv")
     monkeypatch.setattr(engine, "mp4_codec", lambda *args: "libx264")
+    remux = engine.remux_public_mp4
+    remux_calls = []
+
+    def packet_signature(path):
+        with av.open(str(path)) as container:
+            return [
+                (
+                    packet.pts * packet.time_base,
+                    packet.dts * packet.time_base,
+                    packet.duration * packet.time_base,
+                    bytes(packet),
+                )
+                for packet in container.demux(video=0)
+                if packet.dts is not None
+            ]
+
+    def checked_remux(video_path, audio_path, result_path, cancel):
+        signature = packet_signature(video_path)
+        remux(video_path, audio_path, result_path, cancel)
+        # Old FFmpeg CLI versions infer a different final VFR duration during
+        # stream copy. Our mux must preserve every compressed video packet,
+        # including its exact PTS/DTS/duration, without another video encoding.
+        assert packet_signature(result_path) == signature
+        remux_calls.append(True)
+
+    monkeypatch.setattr(engine, "remux_public_mp4", checked_remux)
     engine.export(analysis, output, set(), cloud(), [], mp4, lambda *a: None, Event())
+    assert bool(remux_calls) == mp4
     with av.open(str(output)) as container:
         results = list(container.decode(video=0))
     assert len(results) == len(originals)
