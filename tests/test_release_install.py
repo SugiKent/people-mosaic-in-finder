@@ -6,6 +6,7 @@ import os
 import plistlib
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -29,20 +30,33 @@ builder = load_script("build_macos")
 def package(tmp_path):
     root = tmp_path / "download a space & quote'"
     root.mkdir()
-    (root / "src/people_mosaic").mkdir(parents=True)
-    (root / "src/people_mosaic/app.py").write_text("# released application\n")
-    (root / "scripts").mkdir()
-    (root / "scripts/build_macos.py").write_text("# build fixture\n")
-    (root / "pyproject.toml").write_text('[project]\nversion = "0.1.0"\n')
-    (root / "uv.lock").write_text("# locked fixture\n")
+    app = root / "People Mosaic.app"
+    (app / "Contents/MacOS").mkdir(parents=True)
+    (app / "Contents/Resources/models").mkdir(parents=True)
+    (app / "Contents/Resources/models/verified.onnx").write_bytes(b"bundled verified model")
+    (app / "Contents/Resources/model-alias").symlink_to("models", target_is_directory=True)
+    executable = app / "Contents/MacOS/PeopleMosaic"
+    executable.write_bytes(b"fixture standalone runtime")
+    executable.chmod(0o755)
+    (app / "Contents/Info.plist").write_bytes(
+        plistlib.dumps(
+            {"CFBundleIdentifier": "local.people-mosaic.app", "CFBundleShortVersionString": "0.1.0"}
+        )
+    )
     (root / "README.md").write_text("installation instructions\n")
     set_commit(root, "a")
     return root
 
 
 def set_commit(package, character):
-    release = {"format": 1, "version": "0.1.0", "commit": character * 40}
+    release = {
+        "format": 2,
+        "kind": "app-bundle",
+        "version": "0.1.0",
+        "commit": character * 40,
+    }
     (package / "RELEASE.json").write_text(json.dumps(release))
+    (package / "People Mosaic.app/Contents/Resources/RELEASE.json").write_text(json.dumps(release))
 
 
 @pytest.fixture
@@ -57,14 +71,8 @@ def prepare():
     def run(path):
         calls.append(path)
         # Test the actual app/workflow generator against the immutable version root.
-        previous_root, previous_build = builder.ROOT, builder.BUILD
-        builder.ROOT, builder.BUILD = path, path / "build"
-        try:
-            builder.build()
-        finally:
-            builder.ROOT, builder.BUILD = previous_root, previous_build
-        (path / ".venv/bin").mkdir(parents=True, exist_ok=True)
-        (path / ".venv/bin/python").write_text(str(path))
+        assert (path / "build/People Mosaic.app/Contents/MacOS/PeopleMosaic").is_file()
+        builder.build(path, bundled=True)
 
     run.calls = calls
     return run
@@ -94,10 +102,13 @@ def test_first_install_builds_at_permanent_version_path(package, home, prepare):
     assert current.is_symlink() and current.resolve() == target
     assert app.is_symlink() and app.resolve() == target / "build/People Mosaic.app"
     assert installer.owned(base) and installer.owned(target)
-    assert (target / "src/people_mosaic/app.py").read_bytes() == (
-        package / "src/people_mosaic/app.py"
+    installed_app = target / "build/People Mosaic.app"
+    assert (installed_app / "Contents/MacOS/PeopleMosaic").read_bytes() == (
+        package / "People Mosaic.app/Contents/MacOS/PeopleMosaic"
     ).read_bytes()
-    assert str(target) in (target / ".venv/bin/python").read_text()
+    assert not (target / ".venv").exists()
+    assert not (target / "src").exists()
+    assert (installed_app / "Contents/Resources/model-alias").is_symlink()
     command = workflow_command(workflow)
     assert str(package) not in command
     # Quoting must produce executable shell syntax for a path containing spaces.
@@ -105,17 +116,17 @@ def test_first_install_builds_at_permanent_version_path(package, home, prepare):
     assert installer.owned_workflow(workflow)
 
 
-def test_update_reuses_models_and_reinstall_keeps_same_version_root(package, home, prepare):
+def test_update_copies_bundled_models_and_reinstall_keeps_same_version_root(package, home, prepare):
     installer.install(package, home, prepare)
     base, current, app, workflow = paths(home)
     previous = current.resolve()
-    (previous / "models").mkdir()
-    (previous / "models/verified.onnx").write_bytes(b"previous model for hash validation")
+    model = "build/People Mosaic.app/Contents/Resources/models/verified.onnx"
+    (previous / model).write_bytes(b"old model")
     set_commit(package, "b")
     installer.install(package, home, prepare)
     updated = current.resolve()
     assert updated != previous and previous.exists()
-    assert (updated / "models/verified.onnx").read_bytes() == b"previous model for hash validation"
+    assert (updated / model).read_bytes() == b"bundled verified model"
     assert prepare.calls == [previous, updated]
     assert str(previous) not in workflow_command(workflow)
     assert installer.owned_workflow(workflow)
@@ -211,7 +222,7 @@ def test_foreign_destinations_are_preserved_before_preparation(package, home, pr
 def test_migrates_existing_owned_repository_workflow_and_app_with_backup(package, home, prepare):
     old_root = home / "old repo ' & spaces"
     old_root.mkdir(parents=True)
-    prepare(old_root)
+    builder.build(old_root)
     base, current, app, workflow = paths(home)
     app.parent.mkdir(parents=True)
     workflow.parent.mkdir(parents=True)
@@ -251,3 +262,77 @@ def test_malformed_foreign_bundle_is_not_recognized_as_owned(tmp_path):
     (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps(["not a dictionary"]))
     assert installer.bundle_id(bundle) is None
     assert not installer.owned_workflow(bundle)
+
+
+def test_prepare_only_runs_copied_runtime_self_test_then_builds_workflow(
+    package, home, monkeypatch
+):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+
+    monkeypatch.setattr(installer.subprocess, "run", run)
+    monkeypatch.setitem(sys.modules, "build_macos", builder)
+    installer.install(package, home)
+    _, current, _, workflow = paths(home)
+    assert calls == [
+        (
+            [
+                str(current.resolve() / "build/People Mosaic.app/Contents/MacOS/PeopleMosaic"),
+                "--self-test",
+            ],
+            {"cwd": current.resolve(), "check": True},
+        )
+    ]
+    assert installer.owned_workflow(workflow)
+    assert ".venv" not in workflow_command(workflow)
+    assert "people_mosaic.app" not in workflow_command(workflow)
+
+
+def test_updates_format_one_install_without_copying_its_environment_or_models(
+    package, home, prepare
+):
+    base, current, app, workflow = paths(home)
+    old = base / "versions/0.1.0-cccccccccccc"
+    old.mkdir(parents=True)
+    installer.write_marker(base, {"format": 1})
+    installer.write_marker(old, {"format": 1, "version": "0.1.0", "commit": "c" * 40})
+    (old / ".venv").mkdir()
+    (old / "models").mkdir()
+    (old / "models/old.onnx").write_bytes(b"old downloaded model")
+    builder.build(old)
+    current.symlink_to(old, target_is_directory=True)
+    app.parent.mkdir(parents=True)
+    app.symlink_to(current / "build/People Mosaic.app", target_is_directory=True)
+    workflow.parent.mkdir(parents=True)
+    shutil.copytree(old / "build/People Mosaic.workflow", workflow)
+    installer.install(package, home, prepare)
+    assert current.resolve() != old and old.exists()
+    assert not (current / ".venv").exists()
+    assert not (current / "models").exists()
+    assert installer.owned_workflow(workflow)
+
+
+@pytest.mark.parametrize("bad", ["legacy", "kind", "foreign_app", "provenance", "dirty_bundle"])
+def test_rejects_non_bundled_or_invalid_package_before_any_install_mutation(
+    package, home, prepare, bad
+):
+    if bad == "foreign_app":
+        plist = package / "People Mosaic.app/Contents/Info.plist"
+        plist.write_bytes(plistlib.dumps({"CFBundleIdentifier": "unrelated.app"}))
+    elif bad in {"provenance", "dirty_bundle"}:
+        manifest = package / "People Mosaic.app/Contents/Resources/RELEASE.json"
+        release = json.loads(manifest.read_text())
+        release["commit" if bad == "provenance" else "dirty"] = (
+            "b" * 40 if bad == "provenance" else True
+        )
+        manifest.write_text(json.dumps(release))
+    else:
+        release = json.loads((package / "RELEASE.json").read_text())
+        release["format" if bad == "legacy" else "kind"] = 1 if bad == "legacy" else "source"
+        (package / "RELEASE.json").write_text(json.dumps(release))
+    with pytest.raises(ValueError):
+        installer.install(package, home, prepare)
+    assert prepare.calls == []
+    assert not home.exists()

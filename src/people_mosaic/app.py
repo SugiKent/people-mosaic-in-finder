@@ -31,6 +31,7 @@ from .domain import Face, hidden_faces
 from .errors import UserError
 from .overlay import blend_bgr, cloud, load_png
 from .people_picker import PeoplePicker
+from .runtime import frozen
 
 
 def pixmap(bgr: np.ndarray) -> QPixmap:
@@ -589,7 +590,8 @@ def main():
     parser.add_argument("video", nargs="?", type=Path)
     args = parser.parse_args()
     # Finder's service runner has a minimal PATH.
-    os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
+    if not frozen():
+        os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + os.environ.get("PATH", "")
     app = QApplication(sys.argv[:1])
     app.setApplicationName("People Mosaic")
     app.setStyle("Fusion")

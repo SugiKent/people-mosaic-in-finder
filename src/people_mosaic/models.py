@@ -8,8 +8,9 @@ from pathlib import Path
 import certifi
 
 from .errors import UserError
+from .runtime import frozen, resource_root
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = resource_root()
 MODEL_DIR = ROOT / "models"
 MODELS = {
     "face_detection_yunet_2023mar.onnx": (
@@ -33,12 +34,17 @@ def model_paths() -> tuple[Path, Path]:
     for path in paths:
         if not path.is_file() or digest(path) != MODELS[path.name][1]:
             raise UserError(
-                "顔検出モデルが未準備です。先に scripts/setup.command を実行してください。"
+                "同梱の顔検出モデルを確認できません。アプリを再インストールしてください。"
+                if frozen()
+                else "顔検出モデルが未準備です。先に scripts/setup.command を実行してください。"
             )
     return paths
 
 
 def download() -> None:
+    if frozen():
+        model_paths()
+        return
     MODEL_DIR.mkdir(exist_ok=True)
     for name, (folder, expected) in MODELS.items():
         target = MODEL_DIR / name

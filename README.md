@@ -45,20 +45,21 @@ PNG は 20 MB 以下、縦横 32〜4096 ピクセル。中央の縦横 50% を�
 
 ## ZIP からインストール
 
-macOS 15 以降の Apple Silicon の Mac 向けです。git clone や手動 build は不要です。
+macOS 15 以降の Apple Silicon の Mac 向けです。Python、FFmpeg、GUI ライブラリ、顔認識モデルをアプリに同梱しています。Homebrew・git clone・手動 build は不要で、ZIP のダウンロード後はネット接続なしでインストールできます。
 
-1. [Homebrew 公式サイト](https://brew.sh/ja/) の手順で Homebrew を準備します。
-2. [最新の GitHub Release](https://github.com/SugiKent/people-mosaic-in-finder/releases/latest) の **`People-Mosaic-0.1.0-macOS-arm64.zip`** をダウンロードします。GitHub が自動生成する「Source code (zip)」ではなく、名前に `macOS-arm64` が入った ZIP を選んでください。
-3. ZIP を展開し、**`Install.command`** を開きます。足りない uv・FFmpeg・Python 3.12 を Homebrew で取得し、ライブラリと顔モデルを準備して Finder に登録します。初回はネット接続が必要です。
-4. Finder で動画を右クリック → **クイックアクション → People Mosaic**。単独で開く場合は **`~/Applications/People Mosaic.app`** を開きます。
+1. [最新の GitHub Release](https://github.com/SugiKent/people-mosaic-in-finder/releases/latest) の **`People-Mosaic-0.1.0-macOS-arm64.zip`** をダウンロードします。GitHub が自動生成する「Source code (zip)」や開発者向けの `Sources` ZIP ではなく、名前に `macOS-arm64` が入った ZIP を選んでください。
+2. ZIP を展開し、**`Install.command`** を開きます。同梱のアプリをコピーし、Finder に登録します。依存ツールのインストールやモデルのダウンロードは行いません。
+3. Finder で動画を右クリック → **クイックアクション → People Mosaic**。単独で開く場合は **`~/Applications/People Mosaic.app`** を開きます。
 
-署名済みの単体アプリではなく、ソースを準備するインストーラーです。macOS が起動を止めた場合は、システム設定の **プライバシーとセキュリティ → このまま開く** で、この `Install.command` の実行を許可してください。[Apple の案内](https://support.apple.com/ja-jp/102445)も参照できます。
+Apple の Developer ID 署名・公証は取得していません。macOS が起動を止めた場合は、システム設定の **プライバシーとセキュリティ → このまま開く** から、ダウンロードした `Install.command` または `People Mosaic.app` を許可してください。[Apple の案内](https://support.apple.com/ja-jp/102445)も参照できます。
 
 本体は `~/Library/Application Support/People Mosaic/versions/` の版ごとのフォルダへ保存します。インストール完了後は、ダウンロードした ZIP と展開フォルダを削除できます。Finder アクションは `~/Library/Services/People Mosaic.workflow` です。既にこのツールのアクションがある場合はバックアップして新版へ切り替えます。同名の別アプリ・別アクションは上書きしません。
 
 更新は People Mosaic を閉じてから、新しい Release の ZIP を展開して `Install.command` を開くだけです。以前の版は保持し、準備に失敗した場合は起動先を切り替えません。起動時に GitHub から自動更新することはありません。
 
-ZIP 版を削除する場合は `~/Applications/People Mosaic.app`、`~/Library/Services/People Mosaic.workflow`、`~/Library/Application Support/People Mosaic` をゴミ箱へ移動します。Homebrew の共用ツールは削除しません。
+ZIP 版を削除する場合は `~/Applications/People Mosaic.app`、`~/Library/Services/People Mosaic.workflow`、`~/Library/Application Support/People Mosaic` をゴミ箱へ移動します。
+
+ZIP 版はビルド済みなので、起動のたびに clone したソースを読み直す仕組みではありません。更新する際は新しい ZIP をインストールしてください。ソースを編集して毎回読み込ませたい場合は、次の clone 版を使います。
 
 ## clone してインストール・開発
 
@@ -141,12 +142,21 @@ uv sync --frozen --python /opt/homebrew/bin/python3.12
 
 main への push（PR のマージを含む）で GitHub Actions がテスト・ZIP の作成・Release の公開まで実行します。最新版の main と一致するビルドだけ公開し、実行番号とコミットを含む固有タグを使います。既存の公開 ZIP は上書きしません。手動実行も main から可能です。
 
-ローカルで ZIP だけ作る場合は、必要なソースをコミットしてから実行します。
+ローカルで同梱アプリをビルドする場合は、Apple Silicon の Mac と Xcode Command Line Tools、uv、pkg-config が必要です。配布先の Mac にはこれらは不要です。必要なソースをコミットしてから実行します。
 
 ```sh
+.venv/bin/python scripts/build_ffmpeg.py
+.venv/bin/python scripts/prepare_bundle_runtime.py
+build/freeze-venv/bin/python scripts/collect_bundle_licenses.py
+build/freeze-venv/bin/python scripts/build_bundle.py \
+  --ffmpeg build/ffmpeg/bin/ffmpeg --ffprobe build/ffmpeg/bin/ffprobe
 .venv/bin/python scripts/package_release.py --ref HEAD
+.venv/bin/python scripts/verify_bundle.py \
+  --zip build/releases/People-Mosaic-0.1.0-macOS-arm64.zip
 ```
 
-`build/releases/` に ZIP と SHA256 ファイルが生成されます。ZIP は指定したコミットのソース・インストーラーだけを含み、個人の動画、顔モデル、仮想環境、生成画像は含みません。アプリと Finder の起動用ファイルは、各 Mac のインストール先で生成します。
+`build/releases/` にアプリ ZIP、対応するソース ZIP、SHA256 ファイルが生成されます。アプリ ZIP は指定したコミットからビルドした Python・Qt・OpenCV・PyAV、動画ツール、検証済みの公式顔モデルを含みます。個人の動画・生成画像・開発用仮想環境は含めません。Finder アクションの起動先だけをインストール先に合わせて生成します。
+
+配布用の FFmpeg は LGPL 構成でビルドし、PyAV もそのライブラリに接続します。OpenCV は動画 I/O を外してビルドします。MP4 は Apple のハードウェアエンコーダーを優先し、SDR のソフトウェア代替は OpenH264 を使います。同梱ライブラリのライセンス・著作権表示はアプリ内の `Contents/Resources/licenses/`、対応する上流ソースとビルド手順は同じ Release の `People-Mosaic-Sources-*.zip` に収録します。ライブラリを変更してデバッグすることを制限しません。変更したアプリは `codesign --force --deep --sign - "People Mosaic.app"` でローカル署名を付け直せます。
 
 顔検出と識別は [OpenCV の YuNet / SFace](https://docs.opencv.org/4.12.0/d0/dd4/tutorial_dnn_face.html)、保存用の可逆圧縮は [FFV1](https://github.com/FFmpeg/FFV1) を使用しています。HLG グラフィックスの基準白は [ITU-R BT.2408](https://www.itu.int/dms_pub/itu-r/opb/rep/R-REP-BT.2408-8-2024-PDF-E.pdf) を参照しています。

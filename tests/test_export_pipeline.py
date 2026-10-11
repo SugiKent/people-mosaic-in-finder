@@ -80,7 +80,7 @@ def test_hardware_h264_initialization_failure_uses_software_before_export(monkey
             raise av.error.FFmpegError(5, "hardware unavailable")
 
     monkeypatch.setattr(engine.sys, "platform", "darwin")
-    monkeypatch.setattr(engine.av, "codecs_available", {"h264_videotoolbox"})
+    monkeypatch.setattr(engine.av, "codecs_available", {"h264_videotoolbox", "libx264"})
     monkeypatch.setattr(
         engine.av, "CodecContext", SimpleNamespace(create=lambda *a: HardwareContext())
     )

@@ -8,7 +8,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 from uuid import uuid4
 
@@ -36,10 +35,15 @@ def owned_workflow(path: Path) -> bool:
         return False
     try:
         workflow = plistlib.loads((path / "Contents/document.wflow").read_bytes())
+        info = plistlib.loads((path / "Contents/Info.plist").read_bytes())
         actions = workflow["actions"]
-        return (
-            len(actions) == 1
-            and "-m people_mosaic.app" in actions[0]["action"]["ActionParameters"]["COMMAND_STRING"]
+        if len(actions) != 1:
+            return False
+        action = actions[0]["action"]
+        command = action["ActionParameters"]["COMMAND_STRING"]
+        return action["BundleIdentifier"] == "com.apple.RunShellScript" and (
+            "-m people_mosaic.app" in command
+            or (info.get("MosaicOwner") == OWNER and "/Contents/MacOS/PeopleMosaic" in command)
         )
     except (OSError, ValueError, KeyError, TypeError, plistlib.InvalidFileException):
         return False
@@ -49,35 +53,59 @@ def exists(path: Path) -> bool:
     return path.exists() or path.is_symlink()
 
 
+def matches_release(app: Path, release: dict) -> bool:
+    try:
+        manifest = json.loads((app / "Contents/Resources/RELEASE.json").read_text())
+        info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+        return (
+            isinstance(manifest, dict)
+            and manifest.get("dirty") is not True
+            and all(
+                manifest.get(key) == release[key] for key in ("format", "kind", "version", "commit")
+            )
+            and info.get("CFBundleShortVersionString") == release["version"]
+        )
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
 def write_marker(path: Path, release: dict):
     (path / MARKER).write_text(json.dumps({"owner": OWNER, **release}) + "\n")
 
 
 def prepare(path: Path):
-    python = "/opt/homebrew/bin/python3.12"
+    # Validate the copied runtime entirely offline, before changing any launcher.
+    executable = path / "build/People Mosaic.app/Contents/MacOS/PeopleMosaic"
     subprocess.run(
-        ["/opt/homebrew/bin/uv", "sync", "--frozen", "--no-dev", "--python", python],
+        [str(executable), "--self-test"],
         cwd=path,
         check=True,
     )
-    interpreter = str(path / ".venv/bin/python")
-    subprocess.run([interpreter, "-m", "people_mosaic.models"], cwd=path, check=True)
-    subprocess.run([interpreter, "scripts/build_macos.py"], cwd=path, check=True)
+    from build_macos import build
+
+    build(path, bundled=True)
 
 
 def install(package: Path, home: Path, prepare_install=prepare) -> Path:
     release = json.loads((package / "RELEASE.json").read_text())
-    version = tomllib.loads((package / "pyproject.toml").read_text())["project"]["version"]
+    version = release.get("version") if isinstance(release, dict) else None
     if (
         not isinstance(release, dict)
-        or release.get("format") != 1
-        or release.get("version") != version
+        or release.get("format") != 2
+        or release.get("kind") != "app-bundle"
         or not isinstance(release.get("commit"), str)
         or not re.fullmatch(r"[a-f0-9]{40}", release.get("commit", ""))
         or not isinstance(version, str)
         or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version)
     ):
         raise ValueError("Release 情報を確認できません。ZIP を再ダウンロードしてください。")
+    packaged_app = package / "People Mosaic.app"
+    if (
+        packaged_app.is_symlink()
+        or bundle_id(packaged_app) != "local.people-mosaic.app"
+        or not matches_release(packaged_app, release)
+    ):
+        raise ValueError("同梱のアプリを確認できません。ZIP を再ダウンロードしてください。")
     base = home / "Library/Application Support/People Mosaic"
     versions = base / "versions"
     current = base / "current"
@@ -104,7 +132,7 @@ def install(package: Path, home: Path, prepare_install=prepare) -> Path:
     if not base.exists():
         base.mkdir(parents=True, mode=0o700)
         write_marker(base, {"format": 1})
-    # A second double-click must not race uv, model downloads, or publication.
+    # A second double-click must not race runtime validation or publication.
     lock_fd = os.open(base / ".install.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(lock_fd, "w") as lock:
         try:
@@ -128,17 +156,26 @@ def install_at_paths(
         if created:
             target.mkdir(mode=0o700)
             write_marker(target, release)
-            for name in ("src", "scripts"):
-                shutil.copytree(package / name, target / name)
-            for name in ("pyproject.toml", "uv.lock", "README.md", "RELEASE.json"):
+            (target / "build").mkdir()
+            shutil.copytree(
+                package / "People Mosaic.app",
+                target / "build/People Mosaic.app",
+                symlinks=True,
+            )
+            for name in ("README.md", "RELEASE.json"):
                 shutil.copy2(package / name, target / name)
-            if previous and (previous / "models").is_dir():
-                # The normal model loader checks hashes, downloading again if needed.
-                shutil.copytree(previous / "models", target / "models")
+        if not matches_release(target / "build/People Mosaic.app", release):
+            raise ValueError(
+                "アプリと Release 情報が一致しません。ZIP を再ダウンロードしてください。"
+            )
         prepare_install(target)
         new_workflow = target / "build/People Mosaic.workflow"
         new_app = target / "build/People Mosaic.app"
-        if not owned_workflow(new_workflow) or bundle_id(new_app) != "local.people-mosaic.app":
+        if (
+            not owned_workflow(new_workflow)
+            or bundle_id(new_app) != "local.people-mosaic.app"
+            or not matches_release(new_app, release)
+        ):
             raise ValueError("生成したアプリまたは Finder アクションが不正です。")
     except BaseException:
         if created:

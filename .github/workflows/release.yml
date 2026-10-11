@@ -21,8 +21,9 @@ defaults:
 jobs:
   build:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # macos-15 is the standard Apple Silicon (arm64) runner.
+    runs-on: macos-15
+    timeout-minutes: 90
     steps:
       - name: Check out the triggering commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -32,11 +33,12 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - name: Install test tools and runtime libraries
+      - name: Install build and test tools
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y ffmpeg zsh libegl1 libopengl0
-          python -m pip install uv==0.9.3
+          [[ "$(uname -m)" == arm64 ]]
+          command -v ffmpeg > /dev/null || brew install ffmpeg
+          command -v pkg-config > /dev/null || brew install pkgconf
+          python -m pip install uv==0.11.26
           uv sync --frozen --dev
       - name: Validate source and installer
         env:
@@ -46,8 +48,31 @@ jobs:
           uv run --frozen ruff format --check src scripts tests
           uv run --frozen pytest -q
           zsh -n Install.command scripts/*.command
-      - name: Build the source installer ZIP
-        run: python scripts/package_release.py --ref "$GITHUB_SHA"
+      - name: Download and verify bundled face models
+        run: uv run --frozen python -m people_mosaic.models
+      - name: Build redistribution FFmpeg and the frozen runtime
+        run: |
+          .venv/bin/python scripts/build_ffmpeg.py
+          .venv/bin/python scripts/prepare_bundle_runtime.py
+      - name: Collect bundled licenses and corresponding source archives
+        run: |
+          build/freeze-venv/bin/python scripts/collect_bundle_licenses.py \
+            --output-dir build/bundle-licenses \
+            --sources-output-dir build/releases \
+            --source-cache build/third-party-sources
+      - name: Build the offline Apple Silicon app
+        run: |
+          build/freeze-venv/bin/python scripts/build_bundle.py \
+            --ffmpeg build/ffmpeg/bin/ffmpeg \
+            --ffprobe build/ffmpeg/bin/ffprobe \
+            --licenses-dir build/bundle-licenses
+      - name: Build the offline installer ZIP
+        run: .venv/bin/python scripts/package_release.py --ref "$GITHUB_SHA"
+      - name: Verify offline installation and video processing
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          .venv/bin/python scripts/verify_bundle.py \
+            --zip "build/releases/People-Mosaic-${version}-macOS-arm64.zip"
       - name: Store ZIP and checksum for publication
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -56,6 +81,7 @@ jobs:
             build/releases/*.zip
             build/releases/*.zip.sha256
           if-no-files-found: error
+          compression-level: 0
           retention-days: 7
 
   publish:
@@ -88,15 +114,16 @@ jobs:
           cd release
           sha256sum --check --strict ./*.zip.sha256
           cat > release-notes.md <<'NOTES'
-          Apple Silicon Mac 向けのソースインストーラーです。署名済みの単体アプリではありません。
+          Apple Silicon Mac 向けのアプリ同梱インストーラーです。
 
           1. `People-Mosaic-*-macOS-arm64.zip` をダウンロードして展開します。
           2. `Install.command` を開きます。
-          3. 依存関係のセットアップと Finder アクションの登録が完了したら、`~/Applications/People Mosaic.app` からも起動できます。
+          3. インストールと Finder アクションの登録が完了したら、`~/Applications/People Mosaic.app` からも起動できます。
 
           本体は `~/Library/Application Support/People Mosaic` 配下のバージョン別フォルダにインストールします。
           完了後は、ダウンロードした ZIP と展開したフォルダを削除できます。
-          あらかじめ Homebrew をインストールしてください。初回はネット接続が必要です。Python、FFmpeg、顔認識モデルは Mac 上で取得します。
+          Python、FFmpeg、顔認識モデルは同梱しています。Homebrew、Python の別途インストールや、セットアップ時のネット接続は不要です。
+          Apple の公証は取得していません。macOS の確認画面への対処は README.md を参照してください。
           詳しい手順と macOS の確認画面への対処は、同梱の README.md を参照してください。
           NOTES
           # Keep the Markdown code delimiters literal.

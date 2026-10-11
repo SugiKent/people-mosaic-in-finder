@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +23,7 @@ from .domain import CLUSTER_THRESHOLD, Analysis, Face, Person, hidden_faces, ide
 from .errors import UserError
 from .models import digest, model_paths
 from .overlay import SUPPORTED, PreparedOverlay, native_plane
+from .runtime import tool_path
 from .stabilize import stabilize_faces
 
 
@@ -39,9 +39,7 @@ def check_cancel(cancel: Event) -> None:
 def probe(path: Path) -> dict:
     if not path.is_file():
         raise UserError("動画ファイルを選んでください。")
-    executable = shutil.which("ffprobe")
-    if not executable:
-        raise UserError("FFmpeg が必要です。brew install ffmpeg を実行してください。")
+    executable = tool_path("ffprobe")
     result = subprocess.run(
         [executable, "-v", "error", "-show_streams", "-of", "json", str(path)],
         capture_output=True,
@@ -475,7 +473,11 @@ def mp4_codec(analysis, info):
             # PyAV has no CodecContext.close(); releasing its last reference
             # destroys the temporary hardware session before actual encoding.
             del context
-    return "libx264"
+    if "libx264" in av.codecs_available:
+        return "libx264"
+    if "libopenh264" in av.codecs_available:
+        return "libopenh264"
+    raise UserError("MP4 用のエンコーダーを確認できません。アプリを再インストールしてください。")
 
 
 def remux_public_mp4(video_path: Path, audio_path: Path, output: Path, cancel: Event) -> None:
@@ -588,6 +590,9 @@ def export(
                 video.options = {"profile": "main10" if analysis.hlg else "high", "allow_sw": "0"}
                 if analysis.hlg:
                     video.codec_context.codec_tag = "hvc1"
+            elif codec == "libopenh264":
+                video.bit_rate = public_bitrate(analysis, info)
+                video.codec_context.thread_count = 4
             elif mp4:
                 video.options = {"crf": "16", "preset": "medium"}
                 video.codec_context.thread_count = 4
@@ -636,7 +641,7 @@ def export(
             # masked video timeline even with older system FFmpeg versions.
             audio_only = Path(directory) / "audio.m4a"
             command = [
-                shutil.which("ffmpeg") or "ffmpeg",
+                tool_path("ffmpeg"),
                 "-nostdin",
                 "-hide_banner",
                 "-loglevel",

@@ -9,14 +9,16 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
 
 
-def build() -> None:
-    BUILD.mkdir(exist_ok=True)
-    python = shlex.quote(str(ROOT / ".venv/bin/python"))
-    launch = f'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"\ncd {shlex.quote(str(ROOT))}\n'
+def build(root: Path = ROOT, *, bundled: bool = False) -> None:
+    directory = root / "build"
+    directory.mkdir(exist_ok=True)
+    python = shlex.quote(str(root / ".venv/bin/python"))
+    launch = f'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"\ncd {shlex.quote(str(root))}\n'
+    executable_path = directory / "People Mosaic.app/Contents/MacOS/PeopleMosaic"
+    runner = shlex.quote(str(executable_path)) if bundled else f"{python} -m people_mosaic.app"
     command = (
-        launch
-        + f'for selected_video in "$@"; do\n  {python} -m people_mosaic.app "$selected_video"\ndone\n'
-    )
+        "" if bundled else launch
+    ) + f'for selected_video in "$@"; do\n  {runner} "$selected_video"\ndone\n'
     action_id = str(uuid4()).upper()
     action = {
         "AMAccepts": {"Container": "List", "Optional": True, "Types": ["com.apple.cocoa.string"]},
@@ -59,12 +61,13 @@ def build() -> None:
             "workflowTypeIdentifier": "com.apple.Automator.servicesMenu",
         },
     }
-    contents = BUILD / "People Mosaic.workflow/Contents"
+    contents = directory / "People Mosaic.workflow/Contents"
     contents.mkdir(parents=True, exist_ok=True)
     (contents / "document.wflow").write_bytes(plistlib.dumps(workflow))
     info = {
         "CFBundleIdentifier": "local.people-mosaic.finder",
         "CFBundleName": "People Mosaic",
+        "MosaicOwner": "local.people-mosaic.release",
         "NSServices": [
             {
                 "NSMenuItem": {"default": "People Mosaic"},
@@ -75,7 +78,10 @@ def build() -> None:
         ],
     }
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
-    app_contents = BUILD / "People Mosaic.app/Contents"
+    if bundled:
+        print(f"Quick Action: {directory / 'People Mosaic.workflow'}")
+        return
+    app_contents = directory / "People Mosaic.app/Contents"
     macos = app_contents / "MacOS"
     macos.mkdir(parents=True, exist_ok=True)
     executable = macos / "PeopleMosaic"
