@@ -1,4 +1,4 @@
-"""HLG graphics at reference white; tone mapping is used only for UI display."""
+"""HLG graphics with explicit reference/peak white; UI-only tone mapping."""
 
 import av
 import numpy as np
@@ -11,9 +11,11 @@ A, B, C = 0.17883277, 0.28466892, 0.55991073
 HLG_WHITE = (np.exp((0.75 - C) / A) + B) / 12
 
 
-def hlg_graphics(rgb: np.ndarray) -> np.ndarray:
+def hlg_graphics(rgb: np.ndarray, *, peak_white: bool = False) -> np.ndarray:
     linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
-    linear = np.clip(linear @ SRGB_TO_2020.T, 0, 1) * HLG_WHITE
+    # Delivery overlays keep PNG white at the signal's maximum white. Archival
+    # composition retains the original 75% HLG reference-white convention.
+    linear = np.clip(linear @ SRGB_TO_2020.T, 0, 1) * (1 if peak_white else HLG_WHITE)
     return np.where(
         linear <= 1 / 12, np.sqrt(3 * linear), A * np.log(np.maximum(12 * linear - B, 1e-8)) + C
     )

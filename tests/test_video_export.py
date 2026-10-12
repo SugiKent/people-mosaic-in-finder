@@ -79,11 +79,15 @@ def test_lossless_export_pixels_timing_audio_and_input(source, tmp_path):
 
 def test_mp4_output(source, tmp_path):
     output = tmp_path / "result.mp4"
-    export(source, output, set(), cloud(), [], True, lambda *args: None, Event())
+    white = np.full((64, 64, 4), 255, np.uint8)
+    export(source, output, set(), white, [], True, lambda *args: None, Event())
     with av.open(str(output)) as container:
         assert container.streams.video[0].codec_context.name == "h264"
         assert container.streams.audio[0].codec_context.name == "aac"
-        assert len(list(container.decode(video=0))) == 10
+        frames = list(container.decode(video=0))
+        assert len(frames) == 10
+        for frame in frames:
+            assert np.min(frame.to_ndarray(format="bgr24")[48:52, 68:72]) >= 250
 
 
 @pytest.mark.parametrize("mp4", [False, True])

@@ -439,7 +439,9 @@ class FrameCompositor:
     def __call__(self, original, masks):
         check_cancel(self.cancel)
         if not hasattr(self.lane, "overlay"):
-            self.lane.overlay = PreparedOverlay(self.rgba)
+            self.lane.overlay = PreparedOverlay(
+                self.rgba, hlg_peak_white=self.hlg and self.pixel_format is not None
+            )
         frame = oriented(original, self.rotation)
         self.lane.overlay.blend_native(frame, masks, self.hlg)
         check_cancel(self.cancel)

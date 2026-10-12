@@ -102,7 +102,14 @@ class PreparedOverlay:
     when size and clipping are identical. Instances must not cross worker threads.
     """
 
-    def __init__(self, rgba: np.ndarray, max_cache_bytes: int = 64 * 1024 * 1024):
+    def __init__(
+        self,
+        rgba: np.ndarray,
+        max_cache_bytes: int = 64 * 1024 * 1024,
+        *,
+        hlg_peak_white: bool = False,
+    ):
+        self._hlg_peak_white = hlg_peak_white
         self._source = rgba.astype(np.float32)
         self._source[:, :, :3] *= self._source[:, :, 3:4] / 255
         self._source.flags.writeable = False
@@ -195,8 +202,7 @@ class PreparedOverlay:
                 # Exact bit preservation wherever alpha is zero.
                 np.copyto(target, blended.astype(target.dtype), where=alpha > 0)
 
-    @staticmethod
-    def _prepare_native(patch, sizes, bits, colour_key):
+    def _prepare_native(self, patch, sizes, bits, colour_key):
         _, color_range, colorspace, hlg = colour_key
         factor = 2 ** (bits - 8)
         full_range = color_range == 2
@@ -205,7 +211,7 @@ class PreparedOverlay:
             kr, kb = 0.2627, 0.0593
         rgb = patch[:, :, :3].astype(np.float32) / 255
         if hlg:
-            rgb = hlg_graphics(rgb)
+            rgb = hlg_graphics(rgb, peak_white=self._hlg_peak_white)
         alpha = patch[:, :, 3].astype(np.float32) / 255
         luma = rgb[:, :, 0] * kr + rgb[:, :, 1] * (1 - kr - kb) + rgb[:, :, 2] * kb
         cb = (rgb[:, :, 2] - luma) / (2 * (1 - kb))
