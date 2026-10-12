@@ -441,7 +441,7 @@ class Window(QMainWindow):
         self.default_png.clicked.connect(self.reset_cloud)
         overlay_row.addWidget(self.default_png)
         appearance.addLayout(overlay_row)
-        self.png_label = QLabel("白い雲 · 中央は不透明、周囲はふんわり")
+        self.png_label = QLabel("同梱の雲画像 · 元の透過をそのまま使用")
         self.png_label.setWordWrap(True)
         self.png_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         appearance.addWidget(self.png_label)
@@ -825,7 +825,7 @@ class Window(QMainWindow):
 
     def reset_cloud(self):
         self.rgba = cloud()
-        self.png_label.setText("白いふわふわ · 中央は不透明、周囲はふんわり")
+        self.png_label.setText("同梱の雲画像 · 元の透過をそのまま使用")
         self.repaint_preview()
 
     def set_draw(self, enabled):

@@ -7,7 +7,7 @@ from pathlib import Path
 import av
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image
 
 from .color import hlg_graphics
 from .domain import Face
@@ -17,26 +17,10 @@ SUPPORTED = {f"yuv{s}p{bits}" for s in ("420", "422", "444") for bits in ("", "1
 
 
 def cloud() -> np.ndarray:
-    image = Image.new("L", (512, 512))
-    draw = ImageDraw.Draw(image)
-    # An opaque centre hides facial details; only the perimeter is feathered.
-    for x, y, radius in [
-        (145, 177, 93),
-        (281, 137, 104),
-        (371, 225, 95),
-        (358, 343, 100),
-        (228, 379, 100),
-        (123, 307, 98),
-    ]:
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=255)
-    draw.rectangle((122, 122, 390, 390), fill=255)
-    image = image.filter(ImageFilter.GaussianBlur(14))
-    # Restore the exact opaque central face area after feathering.
-    ImageDraw.Draw(image).rectangle((128, 128, 384, 384), fill=255)
-    rgba = np.empty((512, 512, 4), dtype=np.uint8)
-    rgba[:, :, :3] = (250, 251, 255)
-    rgba[:, :, 3] = np.asarray(image)
-    return rgba
+    """Load the bundled artwork unchanged, including its original transparency."""
+    path = Path(__file__).with_name("assets") / "default-fluffy.png"
+    with Image.open(path) as image:
+        return np.asarray(image.convert("RGBA")).copy()
 
 
 def load_png(path: Path) -> np.ndarray:

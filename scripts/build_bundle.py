@@ -297,7 +297,10 @@ def build(args: argparse.Namespace) -> Path:
     work.mkdir(parents=True, exist_ok=True)
     manifest_file = work / "RELEASE.json"
     manifest_file.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    data = model_data(ROOT) + [(str(manifest_file), ".")]
+    data = model_data(ROOT) + [
+        (str(ROOT / "src/people_mosaic/assets/default-fluffy.png"), "people_mosaic/assets"),
+        (str(manifest_file), "."),
+    ]
     # PyInstaller resolves data sources relative to the generated .spec file,
     # whereas CLI paths are relative to the builder's working directory.
     license_root = args.licenses_dir.resolve()

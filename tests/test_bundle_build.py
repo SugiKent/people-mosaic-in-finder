@@ -202,6 +202,9 @@ def test_relative_license_cli_path_is_readable_from_generated_spec(tmp_path, mon
     notices = checkout / "build/bundle-licenses"
     notices.mkdir(parents=True)
     (notices / "FFMPEG-BUILD.json").write_bytes(b"exact build provenance")
+    asset = checkout / "src/people_mosaic/assets/default-fluffy.png"
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(b"default fluffy illustration")
     monkeypatch.chdir(checkout)
     monkeypatch.setattr(builder, "ROOT", checkout)
     monkeypatch.setattr(builder.sys, "platform", "darwin")
@@ -237,3 +240,4 @@ def test_relative_license_cli_path_is_readable_from_generated_spec(tmp_path, mon
         )
     )
     assert ("licenses", b"exact build provenance") in collected
+    assert ("people_mosaic/assets", b"default fluffy illustration") in collected

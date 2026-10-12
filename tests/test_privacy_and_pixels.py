@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import av
 import numpy as np
 import pytest
@@ -33,8 +35,22 @@ def test_transparent_face_centre_is_rejected(tmp_path):
     Image.new("RGBA", (64, 64), (255, 255, 255, 0)).save(path)
     with pytest.raises(UserError, match="不透明"):
         load_png(path)
-    Image.fromarray(cloud()).save(path)
-    assert load_png(path).shape == (512, 512, 4)
+    safe = np.full((64, 64, 4), 255, np.uint8)
+    safe[:16, :, 3] = 0
+    Image.fromarray(safe).save(path)
+    assert np.array_equal(load_png(path), safe)
+
+
+def test_default_cloud_preserves_every_bundled_pixel_and_original_transparency():
+    source = Path(__file__).parents[1] / "src/people_mosaic/assets/default-fluffy.png"
+    with Image.open(source) as image:
+        expected = np.asarray(image.convert("RGBA"))
+    rgba = cloud()
+    assert rgba.shape == (1400, 2400, 4)
+    assert np.array_equal(rgba, expected)
+    assert np.any(rgba[:, :, 3] == 0)
+    assert np.any((rgba[:, :, 3] > 0) & (rgba[:, :, 3] < 255))
+    assert np.array_equal(rgba, cloud())
 
 
 @pytest.mark.parametrize("format", sorted(SUPPORTED))
