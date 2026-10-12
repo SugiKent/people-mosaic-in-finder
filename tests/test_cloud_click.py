@@ -55,7 +55,9 @@ def test_click_reveals_candidate_in_all_frames_and_export(window, monkeypatch):
     click(window.canvas, 90, 70)
     assert window.revealed() == {0}
     saved = []
-    monkeypatch.setattr("people_mosaic.app.engine.export", lambda *args: saved.append(args[2]))
+    monkeypatch.setattr(
+        "people_mosaic.app.engine.export", lambda *args, **kwargs: saved.append(args[2])
+    )
     monkeypatch.setattr(window, "start_work", lambda operation, success: operation(None, None))
     window.write_video()
     assert saved == [{0}]
@@ -82,8 +84,8 @@ def test_click_pauses_on_displayed_frame_even_with_pending_scrub(window):
 
 
 @pytest.mark.parametrize("kind", ["uncertain", "unassigned", "manual"])
-def test_unselectable_top_cloud_blocks_underlying_person(window, kind):
-    top = Face((70, 50, 40, 40), 1 if kind == "uncertain" else None, False)
+def test_top_cloud_excludes_only_its_track_or_preserves_manual_mask(window, kind):
+    top = Face((70, 50, 40, 40), 1 if kind == "uncertain" else None, False, track_id=99)
     if kind == "manual":
         window.manual.append(top)
     else:
@@ -91,11 +93,13 @@ def test_unselectable_top_cloud_blocks_underlying_person(window, kind):
     window.repaint_preview()
     click(window.canvas, 90, 70)
     assert window.revealed() == set()
-    assert (
-        "追加範囲" in window.status.text()
-        if kind == "manual"
-        else "識別できない" in window.status.text()
-    )
+    if kind == "manual":
+        assert "追加範囲" in window.status.text()
+        assert window.excluded_tracks == []
+    else:
+        assert "この検出の雲を外しました" in window.status.text()
+        assert window.excluded_tracks == [99]
+        assert window.canvas.cloud_at(display_point(window.canvas, 90, 70)).person == 0
 
 
 def test_overlapping_cloud_reveals_only_topmost_candidate(window):

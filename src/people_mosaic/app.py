@@ -9,7 +9,7 @@ from threading import Event
 import cv2
 import numpy as np
 from PySide6.QtCore import QRectF, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -20,14 +20,18 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSlider,
     QSplitter,
+    QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from . import engine
-from .domain import Face, hidden_faces
+from .domain import DEFAULT_DETECTION_SCORE_THRESHOLD, Face, hidden_faces
 from .errors import UserError
 from .overlay import PreparedOverlay, blend_bgr, cloud, load_png
 from .people_picker import PeoplePicker
@@ -41,6 +45,47 @@ def pixmap(bgr: np.ndarray) -> QPixmap:
             rgb.data, rgb.shape[1], rgb.shape[0], rgb.strides[0], QImage.Format.Format_RGB888
         ).copy()
     )
+
+
+def light_palette():
+    """Never inherit macOS appearance: this application uses a light UI only."""
+    palette = QPalette()
+    colors = {
+        QPalette.ColorRole.Window: "#f6f7f4",
+        QPalette.ColorRole.WindowText: "#253c36",
+        QPalette.ColorRole.Base: "#ffffff",
+        QPalette.ColorRole.AlternateBase: "#edf2ed",
+        QPalette.ColorRole.Text: "#253c36",
+        QPalette.ColorRole.Button: "#ffffff",
+        QPalette.ColorRole.ButtonText: "#253c36",
+        QPalette.ColorRole.Highlight: "#d2eddf",
+        QPalette.ColorRole.HighlightedText: "#173d2e",
+        QPalette.ColorRole.ToolTipBase: "#ffffff",
+        QPalette.ColorRole.ToolTipText: "#253c36",
+        QPalette.ColorRole.Link: "#216950",
+        QPalette.ColorRole.LinkVisited: "#216950",
+        QPalette.ColorRole.Light: "#ffffff",
+        QPalette.ColorRole.Midlight: "#e7eee8",
+        QPalette.ColorRole.Mid: "#a8b8ad",
+        QPalette.ColorRole.Dark: "#697a70",
+        QPalette.ColorRole.Shadow: "#45594d",
+        QPalette.ColorRole.PlaceholderText: "#53665f",
+        QPalette.ColorRole.Accent: "#216950",
+    }
+    for group in (
+        QPalette.ColorGroup.Active,
+        QPalette.ColorGroup.Inactive,
+        QPalette.ColorGroup.Disabled,
+    ):
+        for role, color in colors.items():
+            palette.setColor(group, role, QColor(color))
+    for role in (
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.ButtonText,
+    ):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#69776f"))
+    return palette
 
 
 class Worker(QThread):
@@ -73,17 +118,17 @@ class Canvas(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumSize(480, 300)
+        self.setMinimumSize(240, 80)
         self.image = None
         self.overlays = []
         self.pressed_cloud = None
         self.drawing = False
         self.start = self.end = None
         self.setAccessibleName(
-            "加工後の動画プレビュー。雲をクリックするとその人物の雲を外します。"
+            "加工後の動画プレビュー。クリックした雲を外します。"
             "追加範囲モードではドラッグで隠す範囲を追加できます"
         )
-        self.setToolTip("雲をクリックすると、その人物候補の雲を動画全体で外します")
+        self.setToolTip("雲をクリックして、人物候補またはその連続した検出を除外します")
 
     def set_preview(self, bgr, faces, rgba):
         prepared = PreparedOverlay(rgba)
@@ -125,11 +170,11 @@ class Canvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#152026"))
+        painter.fillRect(self.rect(), QColor("#e7eee8"))
         if self.image is not None:
             painter.drawPixmap(self.image_rect().toRect(), self.image)
         else:
-            painter.setPen(QColor("#b7c7cd"))
+            painter.setPen(QColor("#53665f"))
             painter.drawText(
                 self.rect(),
                 Qt.AlignmentFlag.AlignCenter,
@@ -191,83 +236,87 @@ class Canvas(QWidget):
 class Window(QMainWindow):
     def __init__(self, initial: Path | None = None):
         super().__init__()
+        QApplication.instance().styleHints().setColorScheme(Qt.ColorScheme.Light)
+        QApplication.instance().setPalette(light_palette())
         self.analysis = None
         self.input_path = None
         self.worker = None
         self.rgba = cloud()
         self.manual = []
+        self.excluded_tracks = []
+        self.cloud_undo = []
         self.preview_raw = None
         self.preview_index = -1
         self.play_start = None
-        self.setWindowTitle("People Mosaic · 雲で顔を隠す")
-        self.resize(1280, 880)
+        self.default_threshold = round(DEFAULT_DETECTION_SCORE_THRESHOLD * 100)
+        self.setWindowTitle("People Mosaic · 動画の顔を雲で隠す")
+        self.setMinimumSize(640, 480)
+        screen = self.screen().availableGeometry()
+        self.resize(min(1100, screen.width() - 40), min(820, screen.height() - 60))
         self.setAcceptDrops(True)
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(28, 24, 28, 24)
-        layout.setSpacing(9)
-        heading = QLabel("People Mosaic")
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        title = QVBoxLayout()
+        heading = QLabel("動画の顔を、雲で隠す")
         heading.setObjectName("heading")
-        layout.addWidget(heading)
-        layout.addWidget(QLabel("見せたい人だけ、選ぶ。あとは雲にまかせる。"))
-        top = QHBoxLayout()
-        self.open_button = QPushButton("動画を選ぶ")
+        title.addWidget(heading)
+        self.filename = QLabel("People Mosaic · 動画はこの Mac の中だけで処理します")
+        self.filename.setObjectName("muted")
+        self.filename.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        title.addWidget(self.filename)
+        header.addLayout(title, 1)
+        self.open_button = QPushButton("動画を選ぶ…")
         self.open_button.clicked.connect(self.choose_video)
-        top.addWidget(self.open_button)
-        self.filename = QLabel("動画・顔の画像はこの Mac の中だけで処理します")
-        top.addWidget(self.filename, 1)
-        layout.addLayout(top)
-        analysis_row = QHBoxLayout()
-        analysis_row.addWidget(QLabel("顔の解析"))
-        self.analysis_mode = QComboBox()
-        self.analysis_mode.addItems(["高速 · 長辺 1920px", "小さい顔重視 · 元の解像度"])
-        self.analysis_mode.setAccessibleName("顔の解析方法")
-        self.analysis_mode.currentIndexChanged.connect(self.reanalyze)
-        analysis_row.addWidget(self.analysis_mode)
-        analysis_note = QLabel("出力は元の解像度。小さい顔が漏れる場合は元の解像度で再解析。")
-        analysis_note.setWordWrap(True)
-        analysis_row.addWidget(analysis_note, 1)
-        layout.addLayout(analysis_row)
-        split = QSplitter()
+        header.addWidget(self.open_button)
+        layout.addLayout(header)
+        self.steps = QLabel("① 動画を選ぶ   →   ② 雲を確認する   →   ③ 保存する")
+        self.steps.setObjectName("steps")
+        layout.addWidget(self.steps)
+
+        self.pages = QStackedWidget()
+        self.pages.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        welcome = QWidget()
+        welcome_layout = QVBoxLayout(welcome)
+        welcome_layout.addStretch()
+        self.welcome_title = QLabel("ここに動画をドロップ")
+        self.welcome_title.setObjectName("welcomeTitle")
+        self.welcome_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        welcome_layout.addWidget(self.welcome_title)
+        self.welcome_note = QLabel(
+            "または右上の「動画を選ぶ…」から始めましょう。\n顔を見つけて、自動で雲を重ねます。"
+        )
+        self.welcome_note.setWordWrap(True)
+        self.welcome_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        welcome_layout.addWidget(self.welcome_note)
+        welcome_layout.addStretch()
+        self.pages.addWidget(welcome)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.currentChanged.connect(self.tab_changed)
+        self.tabs.setAccessibleName("雲を外す人の選択、調整と設定")
+        self.tabs.setMinimumWidth(260)
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        self.editor = QSplitter(Qt.Orientation.Horizontal)
+        self.editor.setChildrenCollapsible(False)
+        self.pages.addWidget(self.editor)
+        layout.addWidget(self.pages, 1)
+
+        preview = QWidget()
+        preview_layout = QVBoxLayout(preview)
+        preview_layout.setContentsMargins(0, 12, 12, 0)
+        hint = QLabel("最初は全員を隠します。雲を外すときはクリック。")
+        hint.setWordWrap(True)
+        preview_layout.addWidget(hint)
         self.canvas = Canvas()
         self.canvas.region_added.connect(self.add_region)
         self.canvas.cloud_pressed.connect(self.pause_preview_for_cloud)
         self.canvas.cloud_clicked.connect(self.reveal_cloud)
-        split.addWidget(self.canvas)
-        people_panel = QWidget()
-        people_layout = QVBoxLayout(people_panel)
-        people_top = QHBoxLayout()
-        people_top.addWidget(QLabel("雲を付けない人物候補"), 1)
-        self.overview_button = QPushButton("大きな一覧で選ぶ")
-        self.overview_button.clicked.connect(self.show_people_overview)
-        people_top.addWidget(self.overview_button)
-        people_layout.addLayout(people_top)
-        note = QLabel(
-            "映像の雲をクリック、またはチェックで雲を外します。"
-            "顔写真をクリックすると登場位置へ移動します。"
-        )
-        note.setWordWrap(True)
-        people_layout.addWidget(note)
-        self.people = PeoplePicker()
-        self.people.setMinimumWidth(330)
-        self.people.selection_changed.connect(self.repaint_preview)
-        self.people.candidate_clicked.connect(self.jump_to_person)
-        people_layout.addWidget(self.people, 1)
-        self.summary = QLabel(
-            "同じ人が複数候補に分かれる場合があります。\n似ているか曖昧なフレームは隠します。"
-        )
-        self.summary.setWordWrap(True)
-        people_layout.addWidget(self.summary)
-        reset = QPushButton("全員を隠す")
-        reset.clicked.connect(self.hide_everyone)
-        people_layout.addWidget(reset)
-        self.reset_button = reset
-        split.addWidget(people_panel)
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 2)
-        split.setSizes([700, 490])
-        layout.addWidget(split, 1)
+        preview_layout.addWidget(self.canvas, 1)
         scrub = QHBoxLayout()
         self.play = QPushButton("再生")
         self.play.clicked.connect(self.toggle_play)
@@ -278,7 +327,22 @@ class Window(QMainWindow):
         scrub.addWidget(self.slider, 1)
         self.time_label = QLabel("0:00 / 0:00")
         scrub.addWidget(self.time_label)
-        layout.addLayout(scrub)
+        preview_layout.addLayout(scrub)
+
+        def scroll_page(widget):
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setWidget(widget)
+            return scroll
+
+        self.preview_scroll = scroll_page(preview)
+        self.editor.addWidget(self.preview_scroll)
+        self.editor.addWidget(self.tabs)
+        self.editor.setStretchFactor(0, 3)
+        self.editor.setStretchFactor(1, 1)
+        self.editor.setSizes([720, 340])
         self.debounce = QTimer(self)
         self.debounce.setSingleShot(True)
         self.debounce.setInterval(90)
@@ -286,54 +350,194 @@ class Window(QMainWindow):
         self.playback = QTimer(self)
         self.playback.setInterval(100)
         self.playback.timeout.connect(self.tick)
-        overlay_row = QHBoxLayout()
-        self.png = QPushButton("透過 PNG を選ぶ")
+
+        people_panel = QWidget()
+        people_layout = QVBoxLayout(people_panel)
+        people_layout.setContentsMargins(0, 12, 0, 0)
+        self.overview_button = QPushButton("人物一覧を広げる")
+        self.overview_button.clicked.connect(self.show_people_overview)
+        self.people = PeoplePicker(compact=True, reset_all=self.hide_everyone)
+        self.people.selection_changed.connect(self.repaint_preview)
+        self.people.candidate_clicked.connect(self.jump_to_person)
+        people_layout.addWidget(self.people, 1)
+        self.summary = QLabel(
+            "写真をクリックすると動画の登場場面へ移動します。\n"
+            "同じ人が複数の写真に分かれることがあります。判定が曖昧な場面は隠します。"
+        )
+        self.summary.setWordWrap(True)
+        self.summary.setObjectName("muted")
+        self.summary.hide()
+        self.people.setToolTip(self.summary.text())
+        self.people_scroll = scroll_page(people_panel)
+        self.tabs.addTab(self.people_scroll, "雲を外す人")
+
+        self.settings_scroll = QScrollArea()
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        settings = QWidget()
+        settings.setMinimumWidth(0)
+        self.settings_scroll.setWidget(settings)
+        settings_layout = QVBoxLayout(settings)
+        settings_layout.setContentsMargins(0, 12, 12, 12)
+        settings_layout.setSpacing(16)
+        self.tabs.addTab(self.settings_scroll, "調整・設定")
+
+        def section(title, description):
+            card = QWidget()
+            card.setObjectName("card")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 12, 12, 12)
+            card_layout.setSpacing(8)
+            label = QLabel(title)
+            label.setObjectName("sectionTitle")
+            card_layout.addWidget(label)
+            note = QLabel(description)
+            note.setWordWrap(True)
+            note.setObjectName("muted")
+            card_layout.addWidget(note)
+            settings_layout.addWidget(card)
+            return card_layout
+
+        detection = section(
+            "顔を見つける細かさ",
+            "右へ動かすと、看板などの誤検出を減らせます。"
+            "実際の顔も隠れなくなるので、動画で確認してください。",
+        )
+        threshold_row = QHBoxLayout()
+
+        self.detection_threshold = QSlider(Qt.Orientation.Horizontal)
+        self.detection_threshold.setRange(30, 99)
+        self.detection_threshold.setValue(self.default_threshold)
+        self.detection_threshold.setAccessibleName("顔を見つける細かさ。右ほど検出を減らす")
+        self.detection_threshold.setToolTip("顔検出の閾値。変更はすぐ反映され、再解析は不要です。")
+        self.detection_threshold.valueChanged.connect(self.threshold_changed)
+        threshold_row.addWidget(self.detection_threshold, 1)
+
+        detection.addLayout(threshold_row)
+        threshold_ends = QHBoxLayout()
+        threshold_ends.addWidget(QLabel("多く見つける"))
+        threshold_ends.addStretch()
+        threshold_ends.addWidget(QLabel("検出を減らす"))
+        detection.addLayout(threshold_ends)
+        threshold_detail = QHBoxLayout()
+        self.threshold_label = QLabel(f"{DEFAULT_DETECTION_SCORE_THRESHOLD:.2f} · 標準")
+        threshold_detail.addWidget(self.threshold_label, 1)
+        self.threshold_reset = QPushButton("標準に戻す")
+        self.threshold_reset.clicked.connect(
+            lambda: self.detection_threshold.setValue(self.default_threshold)
+        )
+        threshold_detail.addWidget(self.threshold_reset)
+        detection.addLayout(threshold_detail)
+
+        appearance = section(
+            "雲の見た目", "自分の画像も使えます。背景が透明な PNG を選んでください。"
+        )
+        overlay_row = QVBoxLayout()
+        self.png = QPushButton("画像を選ぶ…")
         self.png.clicked.connect(self.choose_png)
         overlay_row.addWidget(self.png)
-        self.default_png = QPushButton("白い雲に戻す")
+        self.default_png = QPushButton("元の雲に戻す")
         self.default_png.clicked.connect(self.reset_cloud)
         overlay_row.addWidget(self.default_png)
+        appearance.addLayout(overlay_row)
         self.png_label = QLabel("白い雲 · 中央は不透明、周囲はふんわり")
-        overlay_row.addWidget(self.png_label, 1)
-        layout.addLayout(overlay_row)
-        region_row = QHBoxLayout()
-        self.region_button = QPushButton("隠す範囲を追加")
+        self.png_label.setWordWrap(True)
+        self.png_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        appearance.addWidget(self.png_label)
+
+        regions = section(
+            "隠したい場所を足す",
+            "顔を見つけられないときに使います。動画の上でドラッグして囲みます。"
+            "囲んだ場所は、動画全体の同じ位置で隠れます。",
+        )
+        region_row = QVBoxLayout()
+        self.region_button = QPushButton("動画で範囲を囲む")
         self.region_button.setCheckable(True)
         self.region_button.toggled.connect(self.set_draw)
         region_row.addWidget(self.region_button)
-        self.undo = QPushButton("追加範囲を 1 つ戻す")
+        self.undo = QPushButton("追加した範囲を戻す")
         self.undo.clicked.connect(self.undo_region)
         region_row.addWidget(self.undo)
-        self.region_note = QLabel("ドラッグで追加 · 動画全体の同じ位置を隠します")
-        region_row.addWidget(self.region_note, 1)
-        layout.addLayout(region_row)
-        output_row = QHBoxLayout()
+        regions.addLayout(region_row)
+        self.region_note = QLabel("追加した範囲はありません")
+        self.region_note.setWordWrap(True)
+        regions.addWidget(self.region_note)
+
+        saving = section(
+            "保存する動画の形式", "保存先は元の動画と同じフォルダです。元の動画は残ります。"
+        )
         self.format = QComboBox()
-        self.format.addItems(["公開用 MP4 · 高画質", "保存用 MKV · 可逆圧縮"])
-        self.format.setAccessibleName("出力形式")
+        self.format.addItems(["MP4 · 共有用（おすすめ）", "MKV · 画質を保つ保存用"])
+        self.format.setAccessibleName("保存する動画の形式")
         self.format.currentIndexChanged.connect(self.format_changed)
-        output_row.addWidget(self.format)
+        saving.addWidget(self.format)
         self.quality_note = QLabel()
         self.quality_note.setWordWrap(True)
-        output_row.addWidget(self.quality_note, 1)
-        self.export_button = QPushButton("確定して書き出す")
+        saving.addWidget(self.quality_note)
+
+        analysis = section(
+            "小さい顔が見つからないとき",
+            "「小さい顔も探す」に変更すると、動画を読み直します。"
+            "雲を外した選択と追加した範囲はリセットされます。",
+        )
+        self.analysis_mode = QComboBox()
+        self.analysis_mode.addItems(["標準 · 速く探す", "小さい顔も探す"])
+        self.analysis_mode.setAccessibleName("顔の解析方法")
+        self.analysis_mode.currentIndexChanged.connect(self.reanalyze)
+        analysis.addWidget(self.analysis_mode)
+        settings_layout.addStretch()
+
+        # The body can shrink/scroll; saving and progress stay outside it.
+        actions = QHBoxLayout()
+        self.reset_button = QPushButton("すべての顔を隠す")
+        self.reset_button.clicked.connect(self.hide_everyone)
+        actions.addWidget(self.reset_button)
+        self.undo_exclusion_button = QPushButton("外した雲を1つ戻す")
+        self.undo_exclusion_button.clicked.connect(self.undo_exclusion)
+        actions.addWidget(self.undo_exclusion_button)
+        actions.addWidget(self.overview_button)
+        actions.addStretch()
+        layout.addLayout(actions)
+        self.exclusion_note = QLabel(
+            "最初は全員の顔に雲が付きます。選ばずに保存することもできます。"
+        )
+        self.exclusion_note.setWordWrap(True)
+        self.exclusion_note.setObjectName("muted")
+        self.exclusion_note.hide()
+        layout.addWidget(self.exclusion_note)
+
+        self.footer = QWidget()
+        self.footer.setObjectName("footer")
+        footer_layout = QVBoxLayout(self.footer)
+        footer_layout.setContentsMargins(16, 12, 16, 12)
+        footer_layout.setSpacing(8)
+        save_row = QHBoxLayout()
+        self.save_note = QLabel("動画を選ぶと、保存できるようになります")
+        self.save_note.setWordWrap(True)
+        self.save_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        save_row.addWidget(self.save_note, 1)
+        self.export_button = QPushButton("動画を保存する")
         self.export_button.setObjectName("primary")
         self.export_button.clicked.connect(self.write_video)
-        output_row.addWidget(self.export_button)
-        layout.addLayout(output_row)
-        progress_row = QHBoxLayout()
+        save_row.addWidget(self.export_button)
+        footer_layout.addLayout(save_row)
+        self.progress_row = QWidget()
+        progress_layout = QHBoxLayout(self.progress_row)
+        progress_layout.setContentsMargins(0, 0, 0, 0)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
-        progress_row.addWidget(self.progress, 1)
-        self.cancel_button = QPushButton("キャンセル")
+        progress_layout.addWidget(self.progress, 1)
+        self.cancel_button = QPushButton("処理を中止")
         self.cancel_button.clicked.connect(self.cancel_work)
-        progress_row.addWidget(self.cancel_button)
-        layout.addLayout(progress_row)
-        self.status = QLabel(
-            "最初は全員を隠します。候補を選び、プレビューで確認してから書き出します。"
-        )
+        progress_layout.addWidget(self.cancel_button)
+        footer_layout.addWidget(self.progress_row)
+        self.status = QLabel("動画を選んで始めましょう。")
         self.status.setWordWrap(True)
-        layout.addWidget(self.status)
+        self.status.setFixedHeight(44)
+        self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        footer_layout.addWidget(self.status)
+        layout.addWidget(self.footer)
         self.format_changed()
         self.set_busy(False)
         if initial:
@@ -358,9 +562,23 @@ class Window(QMainWindow):
             self.undo,
             self.play,
             self.format,
+            self.detection_threshold,
+            self.threshold_reset,
         ):
             widget.setEnabled(ready)
         self.cancel_button.setEnabled(busy)
+        self.progress_row.setVisible(busy)
+        self.steps.setVisible(busy or self.analysis is None)
+        self.steps.setText(
+            "② 顔を探しています…"
+            if busy and self.analysis is None
+            else "③ 動画を保存しています…"
+            if busy
+            else "② 雲を確認する   →   ③ 保存する"
+            if self.analysis is not None
+            else "① 動画を選ぶ   →   ② 雲を確認する   →   ③ 保存する"
+        )
+        self.undo_exclusion_button.setEnabled(ready and bool(self.cloud_undo))
         self.refresh_export()
 
     def refresh_export(self):
@@ -384,11 +602,19 @@ class Window(QMainWindow):
         if self.busy():
             return
         self.input_path = path.resolve()
+        self.pages.setCurrentIndex(0)
+        self.welcome_title.setText("顔を探しています…")
+        self.welcome_note.setText("このまま少しお待ちください。見つけた顔に雲を重ねます。")
+        self.region_button.setChecked(False)
         max_edge = 1920 if self.analysis_mode.currentIndex() == 0 else None
         self.stop_play()
         self.analysis = None
         self.format_changed()
         self.manual.clear()
+        self.excluded_tracks.clear()
+        self.cloud_undo.clear()
+        self.detection_threshold.setValue(self.default_threshold)
+        self.update_exclusions()
         self.people.set_candidates([])
         self.canvas.image = None
         self.canvas.overlays.clear()
@@ -397,8 +623,9 @@ class Window(QMainWindow):
         self.preview_raw = None
         self.preview_index = -1
         self.filename.setText(path.name)
+        self.filename.setToolTip(str(path.resolve()))
         self.setWindowTitle(f"People Mosaic · {path.name}")
-        self.region_note.setText("ドラッグで追加 · 動画全体の同じ位置を隠します")
+        self.region_note.setText("追加した範囲はありません")
         self.start_work(
             lambda progress, cancel: engine.analyze(path.resolve(), progress, cancel, max_edge),
             self.analyzed,
@@ -426,6 +653,10 @@ class Window(QMainWindow):
 
     def analyzed(self, result):
         self.analysis = result
+        self.filename.setText(result.path.name)
+        self.filename.setToolTip(str(result.path))
+        self.pages.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(0)
         self.people.set_candidates(
             (
                 index,
@@ -438,7 +669,7 @@ class Window(QMainWindow):
         self.slider.setRange(0, len(result.frames) - 1)
         self.slider.setValue(0)
         self.status.setText(
-            "解析が完了しました。検出漏れは「隠す範囲を追加」で補ってください。"
+            "準備できました。雲を確認して、よければ「動画を保存する」を押してください。"
             if result.people
             else "人物候補がありません。検出漏れの可能性があるため、動画を確認し必要な範囲を追加してください。"
         )
@@ -477,7 +708,13 @@ class Window(QMainWindow):
         if self.analysis is None or self.preview_raw is None:
             return
         faces = (
-            hidden_faces(self.analysis.frames[self.preview_index], self.revealed()) + self.manual
+            hidden_faces(
+                self.analysis.frames[self.preview_index],
+                self.revealed(),
+                score_threshold=self.detection_threshold.value() / 100,
+                excluded_tracks=set(self.excluded_tracks),
+            )
+            + self.manual
         )
         self.canvas.set_preview(self.preview_raw, faces, self.rgba)
 
@@ -493,13 +730,65 @@ class Window(QMainWindow):
         if self.analysis is None or self.busy() or self.canvas.drawing:
             return
         if any(face is region for region in self.manual):
-            self.status.setText("手動の追加範囲です。「追加範囲を 1 つ戻す」で取り消せます。")
-        elif not face.confident or face.person is None:
-            self.status.setText("人物を確実に識別できないため、この雲は外せません。")
-        elif self.people.reveal(face.person):
+            self.status.setText("手動の追加範囲です。「追加した範囲を戻す」で取り消せます。")
+        elif face.confident and face.person is not None and self.people.reveal(face.person):
+            self.cloud_undo.append(("person", face.person))
+            self.update_exclusions()
             self.status.setText(
                 f"候補 {face.person + 1} の雲を外しました。戻すには一覧のチェックを外してください。"
             )
+        elif face.track_id is not None:
+            if face.track_id not in self.excluded_tracks:
+                self.excluded_tracks.append(face.track_id)
+                self.cloud_undo.append(("track", face.track_id))
+            self.update_exclusions()
+            self.repaint_preview()
+            self.status.setText(
+                "この検出の雲を外しました。連続して追跡できる範囲に反映します。"
+                "戻すには「外した雲を1つ戻す」を押してください。"
+            )
+        else:
+            self.status.setText("この検出を除外できません。動画を再解析してください。")
+
+    def threshold_changed(self, value):
+        self.threshold_label.setText(
+            f"{value / 100:.2f}" + (" · 標準" if value == self.default_threshold else "")
+        )
+        self.repaint_preview()
+        if self.analysis is not None:
+            self.status.setText(
+                f"検出の細かさを変更しました（{value / 100:.2f}）。動画と保存結果に反映します。"
+                "高くすると、実際の顔も隠れなくなることがあります。"
+            )
+
+    def update_exclusions(self):
+        count = len(self.excluded_tracks)
+        self.undo_exclusion_button.setEnabled(
+            self.analysis is not None and not self.busy() and bool(self.cloud_undo)
+        )
+        self.exclusion_note.setVisible(bool(count))
+        self.exclusion_note.setText(
+            f"クリックで除外した検出 {count} 件 · カットや追跡が途切れた後は再び隠します"
+            if count
+            else "最初は全員の顔に雲が付きます。選ばずに保存することもできます。"
+        )
+
+    def undo_exclusion(self):
+        if not self.busy() and self.cloud_undo:
+            kind, target = self.cloud_undo.pop()
+            if kind == "track":
+                if target in self.excluded_tracks:
+                    self.excluded_tracks.remove(target)
+            else:
+                self.people.cover(target)
+            self.update_exclusions()
+            self.repaint_preview()
+            self.status.setText("外した雲を1つ戻しました。")
+
+    def tab_changed(self, index):
+        # Pause when changing the inspector, keeping the video visible.
+        if hasattr(self, "playback"):
+            self.stop_play()
 
     def jump_to_person(self, person):
         if self.analysis:
@@ -511,6 +800,10 @@ class Window(QMainWindow):
             self.people.show_overview()
 
     def hide_everyone(self):
+        self.excluded_tracks.clear()
+        self.cloud_undo.clear()
+        self.detection_threshold.setValue(self.default_threshold)
+        self.update_exclusions()
         self.people.hide_everyone()
 
     def choose_png(self):
@@ -527,11 +820,12 @@ class Window(QMainWindow):
             return
         self.rgba = rgba
         self.png_label.setText(Path(path).name)
+        self.png_label.setToolTip(str(path))
         self.repaint_preview()
 
     def reset_cloud(self):
         self.rgba = cloud()
-        self.png_label.setText("白い雲 · 中央は不透明、周囲はふんわり")
+        self.png_label.setText("白いふわふわ · 中央は不透明、周囲はふんわり")
         self.repaint_preview()
 
     def set_draw(self, enabled):
@@ -539,6 +833,12 @@ class Window(QMainWindow):
         self.canvas.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
         if enabled:
             self.stop_play()
+            self.status.setText(
+                "隠したい場所をドラッグで囲んでください。終了するには下のボタンを押します。"
+            )
+            self.play.setText("範囲追加を終了")
+        else:
+            self.play.setText("再生")
 
     def add_region(self, box):
         self.manual.append(Face(box))
@@ -552,16 +852,28 @@ class Window(QMainWindow):
             self.repaint_preview()
 
     def format_changed(self):
-        if self.analysis and self.analysis.hlg and self.format.currentIndex() == 0:
-            self.quality_note.setText("HDR を維持する HEVC 10bit。再圧縮あり。対応音声はコピー。")
-            return
-        self.quality_note.setText(
-            "映像は再圧縮。対応音声はコピー（それ以外は AAC）。"
-            if self.format.currentIndex() == 0
-            else "加工範囲外の画素を維持。音声はコピー。容量は大きくなります。"
-        )
+        mp4 = self.format.currentIndex() == 0
+        if self.analysis:
+            output = self.analysis.path.with_name(
+                self.analysis.path.stem + "_mosaic" + (".mp4" if mp4 else ".mkv")
+            )
+            self.save_note.setText(f"{'MP4' if mp4 else 'MKV'} · 元の動画と同じフォルダに保存")
+            self.save_note.setToolTip(f"{output}\n同名のファイルがあれば、末尾に番号を付けます。")
+        if self.analysis and self.analysis.hlg and mp4:
+            self.quality_note.setText(
+                "元の HDR の明るさを保ち、高画質で圧縮します。画質は少し変わります。"
+            )
+        else:
+            self.quality_note.setText(
+                "共有しやすい高画質の動画です。圧縮により画質は少し変わります。"
+                if mp4
+                else "雲を重ねた部分以外の画質を保ちます。ファイルが大きくなり、再生できるアプリが限られます。"
+            )
 
     def toggle_play(self):
+        if self.canvas.drawing:
+            self.region_button.setChecked(False)
+            return
         if self.playback.isActive():
             self.stop_play()
         elif self.analysis:
@@ -587,7 +899,7 @@ class Window(QMainWindow):
 
     def stop_play(self):
         self.playback.stop()
-        self.play.setText("再生")
+        self.play.setText("範囲追加を終了" if self.canvas.drawing else "再生")
 
     def write_video(self):
         if not self.analysis or self.busy():
@@ -596,9 +908,20 @@ class Window(QMainWindow):
         extension = ".mp4" if mp4 else ".mkv"
         output = self.analysis.path.with_name(self.analysis.path.stem + "_mosaic" + extension)
         revealed, rgba, manual = self.revealed(), self.rgba.copy(), list(self.manual)
+        threshold = self.detection_threshold.value() / 100
+        excluded = set(self.excluded_tracks)
         self.start_work(
             lambda progress, cancel: engine.export(
-                self.analysis, output, revealed, rgba, manual, mp4, progress, cancel
+                self.analysis,
+                output,
+                revealed,
+                rgba,
+                manual,
+                mp4,
+                progress,
+                cancel,
+                score_threshold=threshold,
+                excluded_tracks=excluded,
             ),
             self.exported,
         )
@@ -618,6 +941,9 @@ class Window(QMainWindow):
 
     def failed(self, message):
         self.status.setText(message)
+        if self.analysis is None:
+            self.welcome_title.setText("動画を読み込めませんでした")
+            self.welcome_note.setText(message + "\n右上から別の動画を選べます。")
         self.progress.setValue(0)
 
     def cancel_work(self):
@@ -647,20 +973,49 @@ class Window(QMainWindow):
 
 
 STYLE = """
-QWidget { font-family: '.AppleSystemUIFont'; font-size: 13px; color: #1d3237; }
-QMainWindow, QMainWindow > QWidget { background: #f4f6f3; }
-QLabel#heading { font-size: 30px; font-weight: 700; }
-QPushButton { background: #ffffff; border: 1px solid #cbd7d0; border-radius: 8px; padding: 9px 14px; }
-QPushButton:hover { background: #e9f1ec; }
+QWidget { font-family: '.AppleSystemUIFont'; font-size: 14px; color: #253c36; }
+QMainWindow, QMainWindow > QWidget, QDialog { background: #f6f7f4; }
+QLabel { background: transparent; }
+QCheckBox { color: #253c36; background: transparent; }
+QCheckBox:disabled { color: #69776f; }
+QTabWidget::pane, QScrollArea > QWidget > QWidget { background: #f6f7f4; }
+QSplitter::handle { background: #d9e0da; width: 5px; }
+QScrollBar:vertical { background: #eef2ed; width: 12px; border: none; }
+QScrollBar::handle:vertical { background: #a1b0a5; min-height: 28px; border-radius: 5px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QLabel#heading { font-size: 24px; font-weight: 700; }
+QLabel#welcomeTitle { font-size: 26px; font-weight: 600; }
+QLabel#sectionTitle { font-size: 17px; font-weight: 600; }
+QLabel#muted { color: #53665f; }
+QLabel#steps { color: #365d50; padding: 8px 12px; background: #e7eee8; border-radius: 8px; }
+QWidget#card, QWidget#footer { background: white; border: 1px solid #d9e0da; border-radius: 12px; }
+QPushButton { background: white; border: 1px solid #bbc9c0; border-radius: 8px;
+              padding: 9px 14px; min-height: 22px; }
+QPushButton:hover { background: #e8f0e9; border-color: #527764; }
+QPushButton:focus { border: 2px solid #216950; }
 QPushButton:checked { background: #d2eddf; }
-QPushButton:disabled { color: #99a8a1; background: #eef1ee; }
-QPushButton#primary { background: #216950; color: white; border: none; font-weight: 600; }
-QPushButton#primary:disabled { background: #b7ccc1; }
-QDialog { background: #f4f6f3; }
-QListView { background: #f4f6f3; border: 1px solid #d5dfd8; border-radius: 10px; padding: 5px; }
-QComboBox { padding: 8px; background: white; border: 1px solid #cbd7d0; border-radius: 8px; }
-QProgressBar { border: none; border-radius: 5px; background: #e1e8e2; height: 12px; text-align: center; }
-QProgressBar::chunk { background: #76b49b; border-radius: 5px; }
+QPushButton:disabled { color: #69776f; background: #eef1ee; border-color: #d8ded8; }
+QPushButton#primary { background: #216950; color: white; border: 2px solid #216950; font-weight: 600; }
+QPushButton#primary:hover { background: #174d3a; }
+QPushButton#primary:focus { border-color: #071f16; }
+QPushButton#primary:disabled { background: #d4dfd7; color: #53665f; border-color: #d4dfd7; }
+QListView { background: #f6f7f4; border: 1px solid #d5dfd8; border-radius: 10px; padding: 5px; }
+QComboBox { padding: 8px; min-height: 22px; background: white;
+            border: 1px solid #bbc9c0; border-radius: 8px; }
+QComboBox:focus { border: 2px solid #216950; }
+QScrollArea { background: #f6f7f4; border: none; }
+QTabWidget::pane { border: none; }
+QTabBar::tab { padding: 12px 10px; color: #53665f; border-bottom: 3px solid transparent; }
+QTabBar::tab:selected { color: #216950; border-bottom: 3px solid #216950; font-weight: 600; }
+QTabBar::tab:hover { background: #e7eee8; }
+QProgressBar { border: none; border-radius: 5px; background: #e1e8e2;
+               height: 16px; text-align: center; }
+QProgressBar::chunk { background: #85b59e; border-radius: 5px; }
+QSlider::groove:horizontal { height: 6px; background: #d1ddd3; border-radius: 3px; }
+QSlider::handle:horizontal { background: #216950; width: 18px; height: 18px;
+                            margin: -6px 0; border-radius: 9px; }
+QSlider::handle:horizontal:disabled { background: #94a69b; }
 """
 
 
@@ -674,7 +1029,7 @@ def main():
     app = QApplication(sys.argv[:1])
     app.setApplicationName("People Mosaic")
     app.setStyle("Fusion")
-    app.setPalette(app.style().standardPalette())
+    app.setPalette(light_palette())
     app.setStyleSheet(STYLE)
     window = Window(args.video)
     window.show()

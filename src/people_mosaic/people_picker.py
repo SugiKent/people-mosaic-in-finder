@@ -130,7 +130,7 @@ class FaceCardDelegate(QStyledItemDelegate):
         )
         check = QStyleOptionButton()
         check.rect = self.checkbox_rect(option.rect)
-        check.text = "雲を付けない"
+        check.text = "雲を外す"
         check.state = QStyle.StateFlag.State_On if checked else QStyle.StateFlag.State_Off
         if enabled:
             check.state |= QStyle.StateFlag.State_Enabled
@@ -160,7 +160,7 @@ class PeoplePicker(QWidget):
     selection_changed = Signal()
     candidate_clicked = Signal(int)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, compact=True, reset_all=None):
         super().__init__(parent)
         self.model = QStandardItemModel(self)
         self.loading = False
@@ -170,13 +170,14 @@ class PeoplePicker(QWidget):
         self.model.itemChanged.connect(self.changed)
         self.proxy.rowsRemoved.connect(self.update_count)
         self.proxy.rowsInserted.connect(self.update_count)
+        self.reset_all = reset_all
         self.controls = []
         self.count_labels = []
         self.empty_labels = []
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(self.make_controls())
-        self.view = self.make_view(compact=True)
+        self.view = self.make_view(compact=compact)
         layout.addWidget(self.view, 1)
         self.add_count(layout)
         self.update_count()
@@ -192,24 +193,25 @@ class PeoplePicker(QWidget):
         view.setGridSize(delegate.card_size)
         if compact:
             view.setMinimumHeight(delegate.card_size.height() + 14)
+        view.setMinimumHeight(80)
         view.setUniformItemSizes(True)
         view.setSpacing(0)
         view.setSelectionMode(QListView.SelectionMode.SingleSelection)
         view.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
         view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        view.setAccessibleName("人物候補の顔カード。雲を付けないチェック、またはスペースで選択")
+        view.setAccessibleName("人物候補の顔カード。雲を外すチェック、またはスペースで選択")
         view.face_clicked.connect(self.candidate_clicked)
         return view
 
     def make_controls(self):
         row = QHBoxLayout()
         sort = QComboBox()
-        sort.addItems(["登場順", "検出回数が多い順"])
+        sort.addItems(["登場順", "よく映る順"])
         sort.setAccessibleName("人物候補の並べ替え")
         sort.setCurrentIndex(int(self.proxy.frequent_first))
-        only = QCheckBox("選択済みだけ")
+        only = QCheckBox("選んだ人だけ")
         only.setChecked(self.proxy.selected_only)
-        only.setToolTip("雲を付けない候補だけ表示します。表示を絞っても選択は保持されます。")
+        only.setToolTip("雲を外す候補だけ表示します。表示を絞っても選択は保持されます。")
         sort.currentIndexChanged.connect(self.sort_changed)
         only.toggled.connect(self.filter_changed)
         self.controls.append((sort, only))
@@ -234,7 +236,7 @@ class PeoplePicker(QWidget):
         self.model.clear()
         for person, photo, seconds, count in candidates:
             first = f"{int(seconds) // 60}:{int(seconds) % 60:02d}"
-            item = QStandardItem(f"候補 {person + 1} · 登場 {first} · 雲を付けない")
+            item = QStandardItem(f"候補 {person + 1} · 登場 {first} · 雲を外す")
             item.setIcon(QIcon(photo))
             item.setEditable(False)
             item.setCheckable(True)
@@ -265,6 +267,14 @@ class PeoplePicker(QWidget):
                 return True
         return False
 
+    def cover(self, person):
+        for row in range(self.model.rowCount()):
+            item = self.model.item(row)
+            if item.data(PERSON_ROLE) == person:
+                item.setCheckState(Qt.CheckState.Unchecked)
+                return True
+        return False
+
     def changed(self, item):
         if self.loading:
             return
@@ -275,14 +285,14 @@ class PeoplePicker(QWidget):
         if self.loading:
             return
         selected = len(self.revealed())
-        text = f"全 {self.model.rowCount()} 候補 · 雲なし {selected} 候補"
+        text = f"全 {self.model.rowCount()} 候補 · 雲を外す {selected} 候補"
         if self.proxy.selected_only:
             text += f" · 一覧に {self.proxy.rowCount()} 候補"
         for label in self.count_labels:
             label.setText(text)
         for label in self.empty_labels:
             label.setText(
-                "選択済みの候補はありません。「選択済みだけ」を外して選んでください。"
+                "選択済みの候補はありません。「選んだ人だけ」を外して選んでください。"
                 if self.proxy.selected_only
                 else "解析すると顔写真がここに表示されます。"
             )
@@ -317,13 +327,13 @@ class PeoplePicker(QWidget):
 
     def show_overview(self):
         dialog = QDialog(self)
-        dialog.setWindowTitle("雲を付けない人物候補 · 大きな一覧")
+        dialog.setWindowTitle("雲を外す人物候補 · 大きな一覧")
         dialog.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
         screen = self.screen().availableGeometry()
         dialog.resize(min(1250, screen.width() - 60), min(850, screen.height() - 60))
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(24, 20, 24, 20)
-        heading = QLabel("雲を付けない人を選ぶ")
+        heading = QLabel("雲を外す人を選ぶ")
         heading.setObjectName("heading")
         layout.addWidget(heading)
         note = QLabel(
@@ -337,8 +347,8 @@ class PeoplePicker(QWidget):
         layout.addWidget(view, 1)
         self.add_count(layout)
         buttons = QHBoxLayout()
-        reset = QPushButton("全員を隠す")
-        reset.clicked.connect(self.hide_everyone)
+        reset = QPushButton("すべての顔を隠す")
+        reset.clicked.connect(self.reset_all or self.hide_everyone)
         buttons.addWidget(reset)
         buttons.addStretch()
         done = QPushButton("動画に戻って確認")
