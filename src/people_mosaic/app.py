@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 from . import engine
 from .domain import Face, hidden_faces
 from .errors import UserError
-from .overlay import blend_bgr, cloud, load_png
+from .overlay import PreparedOverlay, blend_bgr, cloud, load_png
 from .people_picker import PeoplePicker
 from .runtime import frozen
 
@@ -68,26 +68,59 @@ class Worker(QThread):
 
 class Canvas(QWidget):
     region_added = Signal(tuple)
+    cloud_pressed = Signal()
+    cloud_clicked = Signal(object)
 
     def __init__(self):
         super().__init__()
         self.setMinimumSize(480, 300)
         self.image = None
+        self.overlays = []
+        self.pressed_cloud = None
         self.drawing = False
         self.start = self.end = None
         self.setAccessibleName(
-            "加工後の動画プレビュー。追加範囲モードでドラッグすると隠す範囲を追加できます"
+            "加工後の動画プレビュー。雲をクリックするとその人物の雲を外します。"
+            "追加範囲モードではドラッグで隠す範囲を追加できます"
         )
+        self.setToolTip("雲をクリックすると、その人物候補の雲を動画全体で外します")
+
+    def set_preview(self, bgr, faces, rgba):
+        prepared = PreparedOverlay(rgba)
+        self.image = pixmap(blend_bgr(bgr, faces, rgba, prepared=prepared))
+        self.overlays = []
+        for face in faces:
+            region = prepared.placement(face.box, bgr.shape[1], bgr.shape[0])
+            if region is not None:
+                x, y, patch = region
+                self.overlays.append((face, x, y, patch[:, :, 3].copy()))
+        self.pressed_cloud = None
+        self.update()
+
+    def cloud_at(self, position):
+        display = self.image_rect()
+        if self.image is None or not display.contains(position) or display.isEmpty():
+            return None
+        x = int((position.x() - display.x()) * self.image.width() / display.width())
+        y = int((position.y() - display.y()) * self.image.height() / display.height())
+        # Later clouds are drawn on top. An unselectable cloud also blocks clicks.
+        for face, left, top, alpha in reversed(self.overlays):
+            px, py = x - left, y - top
+            if 0 <= py < alpha.shape[0] and 0 <= px < alpha.shape[1] and alpha[py, px] > 0:
+                return face
+        return None
 
     def image_rect(self):
         if self.image is None:
             return QRectF()
         size = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
         return QRectF(
-            (self.width() - size.width()) / 2,
-            (self.height() - size.height()) / 2,
-            size.width(),
-            size.height(),
+            QRectF(
+                (self.width() - size.width()) / 2,
+                (self.height() - size.height()) / 2,
+                size.width(),
+                size.height(),
+            ).toRect()
         )
 
     def paintEvent(self, event):
@@ -107,9 +140,17 @@ class Canvas(QWidget):
             painter.drawRect(QRectF(self.start, self.end).normalized())
 
     def mousePressEvent(self, event):
+        self.pressed_cloud = None
+        if not self.isEnabled() or event.button() != Qt.MouseButton.LeftButton:
+            return
         if self.drawing and self.image_rect().contains(event.position()):
             self.start = self.end = event.position()
             self.update()
+        elif not self.drawing:
+            face = self.cloud_at(event.position())
+            if face is not None:
+                self.pressed_cloud = (face, event.position())
+                self.cloud_pressed.emit()
 
     def mouseMoveEvent(self, event):
         if self.start is not None:
@@ -117,6 +158,18 @@ class Canvas(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event):
+        pressed, self.pressed_cloud = self.pressed_cloud, None
+        if not self.isEnabled() or event.button() != Qt.MouseButton.LeftButton:
+            return
+        if not self.drawing:
+            if (
+                pressed is not None
+                and (event.position() - pressed[1]).manhattanLength()
+                <= QApplication.startDragDistance()
+                and self.cloud_at(event.position()) is pressed[0]
+            ):
+                self.cloud_clicked.emit(pressed[0])
+            return
         if self.start is None or self.image is None:
             return
         rect = QRectF(self.start, event.position()).normalized().intersected(self.image_rect())
@@ -179,6 +232,8 @@ class Window(QMainWindow):
         split = QSplitter()
         self.canvas = Canvas()
         self.canvas.region_added.connect(self.add_region)
+        self.canvas.cloud_pressed.connect(self.pause_preview_for_cloud)
+        self.canvas.cloud_clicked.connect(self.reveal_cloud)
         split.addWidget(self.canvas)
         people_panel = QWidget()
         people_layout = QVBoxLayout(people_panel)
@@ -188,7 +243,10 @@ class Window(QMainWindow):
         self.overview_button.clicked.connect(self.show_people_overview)
         people_top.addWidget(self.overview_button)
         people_layout.addLayout(people_top)
-        note = QLabel("チェックで雲を外します。顔写真をクリックすると登場位置へ移動します。")
+        note = QLabel(
+            "映像の雲をクリック、またはチェックで雲を外します。"
+            "顔写真をクリックすると登場位置へ移動します。"
+        )
         note.setWordWrap(True)
         people_layout.addWidget(note)
         self.people = PeoplePicker()
@@ -333,6 +391,8 @@ class Window(QMainWindow):
         self.manual.clear()
         self.people.set_candidates([])
         self.canvas.image = None
+        self.canvas.overlays.clear()
+        self.canvas.pressed_cloud = None
         self.canvas.update()
         self.preview_raw = None
         self.preview_index = -1
@@ -419,8 +479,27 @@ class Window(QMainWindow):
         faces = (
             hidden_faces(self.analysis.frames[self.preview_index], self.revealed()) + self.manual
         )
-        self.canvas.image = pixmap(blend_bgr(self.preview_raw, faces, self.rgba))
-        self.canvas.update()
+        self.canvas.set_preview(self.preview_raw, faces, self.rgba)
+
+    def pause_preview_for_cloud(self):
+        self.stop_play()
+        self.debounce.stop()
+        # A pending scrub may point beyond the frame actually displayed.
+        self.slider.blockSignals(True)
+        self.slider.setValue(self.preview_index)
+        self.slider.blockSignals(False)
+
+    def reveal_cloud(self, face):
+        if self.analysis is None or self.busy() or self.canvas.drawing:
+            return
+        if any(face is region for region in self.manual):
+            self.status.setText("手動の追加範囲です。「追加範囲を 1 つ戻す」で取り消せます。")
+        elif not face.confident or face.person is None:
+            self.status.setText("人物を確実に識別できないため、この雲は外せません。")
+        elif self.people.reveal(face.person):
+            self.status.setText(
+                f"候補 {face.person + 1} の雲を外しました。戻すには一覧のチェックを外してください。"
+            )
 
     def jump_to_person(self, person):
         if self.analysis:

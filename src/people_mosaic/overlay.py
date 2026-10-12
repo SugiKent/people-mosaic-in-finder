@@ -77,9 +77,16 @@ def _geometry(box: tuple, width: int, height: int, shape: tuple, scale: float):
     return x1, y1, (right - left, bottom - top, left - x1, top - y1, x2 - x1, y2 - y1)
 
 
-def blend_bgr(bgr: np.ndarray, faces: list[Face], rgba: np.ndarray) -> np.ndarray:
+def blend_bgr(
+    bgr: np.ndarray,
+    faces: list[Face],
+    rgba: np.ndarray,
+    *,
+    prepared: "PreparedOverlay | None" = None,
+) -> np.ndarray:
     output = bgr.copy()
-    prepared = PreparedOverlay(rgba)
+    if prepared is None:
+        prepared = PreparedOverlay(rgba)
     for face in faces:
         region = prepared.placement(face.box, bgr.shape[1], bgr.shape[0])
         if region is None:

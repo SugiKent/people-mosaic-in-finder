@@ -256,6 +256,15 @@ class PeoplePicker(QWidget):
             if self.model.item(row).checkState() == Qt.CheckState.Checked
         }
 
+    def reveal(self, person):
+        """Select by immutable ID, even when the card is filtered out or sorted."""
+        for row in range(self.model.rowCount()):
+            item = self.model.item(row)
+            if item.data(PERSON_ROLE) == person:
+                item.setCheckState(Qt.CheckState.Checked)
+                return True
+        return False
+
     def changed(self, item):
         if self.loading:
             return
