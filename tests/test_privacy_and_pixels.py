@@ -46,7 +46,7 @@ def test_default_cloud_preserves_every_bundled_pixel_and_original_transparency()
     with Image.open(source) as image:
         expected = np.asarray(image.convert("RGBA"))
     rgba = cloud()
-    assert rgba.shape == (1400, 2400, 4)
+    assert rgba.shape == expected.shape
     assert np.array_equal(rgba, expected)
     assert np.any(rgba[:, :, 3] == 0)
     assert np.any((rgba[:, :, 3] > 0) & (rgba[:, :, 3] < 255))
