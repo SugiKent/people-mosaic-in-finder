@@ -1,26 +1,14 @@
-import os
 from pathlib import Path
 
 import numpy as np
-import pytest
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QListView
+from PySide6.QtWidgets import QDialog, QListView
 
-from people_mosaic.app import STYLE, Window
+from people_mosaic.app import Window
 from people_mosaic.domain import Analysis, Person
 from people_mosaic.people_picker import PERSON_ROLE, PeoplePicker
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    app = QApplication.instance() or QApplication([])
-    app.setStyle("Fusion")
-    app.setPalette(app.style().standardPalette())
-    app.setStyleSheet(STYLE)
-    return app
 
 
 def candidates(count=256):

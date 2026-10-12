@@ -1,20 +1,12 @@
-import os
 from pathlib import Path
 
 import numpy as np
 import pytest
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
 
 from people_mosaic.app import Canvas, Window
 from people_mosaic.domain import Analysis, Face, Person, hidden_faces
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    return QApplication.instance() or QApplication([])
 
 
 def display_point(canvas, x, y):
