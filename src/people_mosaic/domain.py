@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 
 CLUSTER_THRESHOLD = 0.42
+DEFAULT_DETECTION_SCORE_THRESHOLD = 0.80
 
 
 @dataclass
@@ -12,6 +13,8 @@ class Face:
     person: int | None = None
     confident: bool = False
     feature: np.ndarray | None = None
+    score: float = 1.0
+    track_id: int | None = None
 
 
 @dataclass
@@ -47,8 +50,21 @@ def identify(feature: np.ndarray, people: list[Person]) -> tuple[int | None, boo
     return best, bool(scores[best] >= 0.75)
 
 
-def hidden_faces(faces: list[Face], revealed: set[int]) -> list[Face]:
-    return [face for face in faces if not (face.confident and face.person in revealed)]
+def hidden_faces(
+    faces: list[Face],
+    revealed: set[int],
+    *,
+    score_threshold: float = DEFAULT_DETECTION_SCORE_THRESHOLD,
+    excluded_tracks: set[int] | None = None,
+) -> list[Face]:
+    excluded_tracks = excluded_tracks or set()
+    return [
+        face
+        for face in faces
+        if face.score >= score_threshold
+        and face.track_id not in excluded_tracks
+        and not (face.confident and face.person in revealed)
+    ]
 
 
 def iou(a: tuple, b: tuple) -> float:

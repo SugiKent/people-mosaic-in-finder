@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import subprocess
 import sys
@@ -19,7 +20,16 @@ import numpy as np
 from av.codec.hwaccel import HWAccel, hwdevices_available
 
 from .color import display_bgr
-from .domain import CLUSTER_THRESHOLD, Analysis, Face, Person, hidden_faces, identify, iou
+from .domain import (
+    CLUSTER_THRESHOLD,
+    DEFAULT_DETECTION_SCORE_THRESHOLD,
+    Analysis,
+    Face,
+    Person,
+    hidden_faces,
+    identify,
+    iou,
+)
 from .errors import UserError
 from .models import digest, model_paths
 from .overlay import SUPPORTED, PreparedOverlay, native_plane
@@ -66,11 +76,18 @@ def probe(path: Path) -> dict:
         or video.get("color_primaries") != "bt2020"
     ):
         raise UserError("HLG は BT.2020 の YUV 420 10bit に対応しています。")
-    video["audio_codecs"] = [
-        s.get("codec_name")
-        for s in json.loads(result.stdout)["streams"]
-        if s["codec_type"] == "audio"
-    ]
+    audio = [s for s in json.loads(result.stdout)["streams"] if s["codec_type"] == "audio"]
+    has_aac = any(s.get("codec_name") == "aac" for s in audio)
+    # iPhone MOVs may include APAC spatial audio alongside a normal AAC track.
+    # FFmpeg/PyAV cannot template that auxiliary stream; retain the playable AAC.
+    apac = [s for s in audio if s.get("codec_tag_string") == "apac"]
+    if apac and not has_aac:
+        raise UserError(
+            "この動画の APAC 空間音声は未対応です。AAC 音声を含む動画を選んでください。"
+        )
+    selected_audio = [s for s in audio if s not in apac]
+    video["audio_indices"] = [s["index"] for s in selected_audio]
+    video["audio_codecs"] = [s.get("codec_name") for s in selected_audio]
     if video.get("field_order", "progressive") not in {"progressive", "unknown"}:
         raise UserError("インターレース動画は未対応です。")
     if video["width"] % 2 or video["height"] % 2:
@@ -107,6 +124,7 @@ def oriented(frame: av.VideoFrame, rotation: int) -> av.VideoFrame:
 ANALYSIS_WORKERS = 4
 OPENCV_THREADS = 2
 TRACKING_LONG_EDGE = 960
+DETECTION_SCORE_FLOOR = 0.30
 
 
 def tracking_gray(bgr: np.ndarray) -> np.ndarray:
@@ -164,17 +182,20 @@ class FrameAnalyzer:
         rotation: int,
         cancel: Event,
         max_edge: int | None = None,
+        *,
+        score_threshold: float = DETECTION_SCORE_FLOOR,
     ):
         self.detector_path, self.recognizer_path = detector_path, recognizer_path
         self.rotation, self.cancel = rotation, cancel
         self.max_edge = max_edge
+        self.score_threshold = score_threshold
         self.lane = local()
 
     def __call__(self, original: av.VideoFrame) -> tuple:
         check_cancel(self.cancel)
         if not hasattr(self.lane, "detector"):
             self.lane.detector = cv2.FaceDetectorYN.create(
-                str(self.detector_path), "", (320, 320), 0.65, 0.3, 5000
+                str(self.detector_path), "", (320, 320), self.score_threshold, 0.3, 5000
             )
             self.lane.recognizer = cv2.FaceRecognizerSF.create(str(self.recognizer_path), "")
         bgr = original.to_ndarray(format="bgr24")
@@ -199,7 +220,7 @@ class FrameAnalyzer:
         found = []
         for detection in detections if detections is not None else []:
             check_cancel(self.cancel)
-            face = Face(tuple(float(value) for value in detection[:4]))
+            face = Face(tuple(float(value) for value in detection[:4]), score=float(detection[-1]))
             aligned = None
             if min(face.box[2:]) >= 32 and detection[-1] >= 0.85:
                 aligned = self.lane.recognizer.alignCrop(bgr, detection)
@@ -279,7 +300,7 @@ def analyze(
         detector_path, recognizer_path, info["rotation"], cancel, max_edge
     )
     previous_gray = None
-    held: list[tuple[Face, float]] = []
+    held: list[tuple[Face, float, list[tuple[float, float]]]] = []
     cut_frames = set()
     with analysis_decoder(path, hardware) as (stream, decoded):
         fps = float(stream.average_rate or stream.base_rate or 30)
@@ -313,7 +334,10 @@ def analyze(
                         face.person, face.confident, face.feature = person, confident, feature
                     faces.append(face)
                 # Tracking never grants an exemption. A missed/reacquired face is hidden.
-                next_held = [(face, timestamp) for face in faces]
+                # Cache actual detector scores, never the effective held score:
+                # low-score reacquisitions must not erase the existing 0.5 s
+                # protection or renew an old high score indefinitely.
+                next_held = [(face, timestamp, [(timestamp, face.score)]) for face in faces]
                 scene_cut = (
                     previous_gray is not None and np.mean(cv2.absdiff(gray, previous_gray)) >= 45
                 )
@@ -321,18 +345,45 @@ def analyze(
                     cut_frames.add(index)
                 if previous_gray is not None and not scene_cut:
                     eligible = [
-                        (face, last_seen)
-                        for face, last_seen in held
+                        (face, last_seen, history)
+                        for face, last_seen, history in held
                         if timestamp - last_seen <= 0.5
                     ]
                     boxes = follow_all(
-                        previous_gray, gray, [face for face, _ in eligible], width, height
+                        previous_gray, gray, [face for face, _, _ in eligible], width, height
                     )
-                    for box, (_, last_seen) in zip(boxes, eligible, strict=True):
-                        moved = Face(box)
+                    overlaps = sorted(
+                        (-overlap, old, current)
+                        for old, box in enumerate(boxes)
+                        for current, face in enumerate(faces)
+                        if (overlap := iou(box, face.box)) > 0.2
+                    )
+                    matched_old, matched_current = set(), set()
+                    for _, old, current in overlaps:
+                        if old in matched_old or current in matched_current:
+                            continue
+                        history = [
+                            (seen, score)
+                            for seen, score in eligible[old][2]
+                            if timestamp - seen <= 0.5
+                        ] + next_held[current][2]
+                        face = faces[current]
+                        face.score = max(score for _, score in history)
+                        next_held[current] = (face, timestamp, history)
+                        matched_old.add(old)
+                        matched_current.add(current)
+                    for old, (box, (_, last_seen, history)) in enumerate(
+                        zip(boxes, eligible, strict=True)
+                    ):
+                        if old in matched_old:
+                            continue
+                        history = [
+                            (seen, score) for seen, score in history if timestamp - seen <= 0.5
+                        ]
+                        moved = Face(box, score=max(score for _, score in history))
                         if not any(iou(moved.box, face.box) > 0.2 for face in faces):
                             faces.append(moved)
-                            next_held.append((moved, last_seen))
+                            next_held.append((moved, last_seen, history))
                 held, previous_gray = next_held, gray
                 analysis.frames.append(faces)
                 analysis.times.append(timestamp)
@@ -397,9 +448,23 @@ class FrameCompositor:
         return frame
 
 
-def composited_packets(source, video, analysis, revealed, manual, composite, cancel):
+def composited_packets(
+    source,
+    video,
+    analysis,
+    revealed,
+    manual,
+    composite,
+    cancel,
+    *,
+    score_threshold=DEFAULT_DETECTION_SCORE_THRESHOLD,
+    excluded_tracks=None,
+):
     """Parallelize composition, keeping all video/audio events in demux order."""
     pending = deque()
+    revealed = set(revealed)
+    excluded_tracks = set(excluded_tracks or ())
+    manual = list(manual)
     executor = ThreadPoolExecutor(max_workers=EXPORT_WORKERS, thread_name_prefix="composite")
     count = 0
     try:
@@ -419,7 +484,15 @@ def composited_packets(source, video, analysis, revealed, manual, composite, can
                     # Decoder reference buffers must stay immutable. FFmpeg copies
                     # shared buffers here, before any worker can change the pixels.
                     original.make_writable()
-                    masks = hidden_faces(analysis.frames[count], revealed) + manual
+                    masks = (
+                        hidden_faces(
+                            analysis.frames[count],
+                            revealed,
+                            score_threshold=score_threshold,
+                            excluded_tracks=excluded_tracks,
+                        )
+                        + manual
+                    )
                     pending.append((True, executor.submit(composite, original, masks)))
                     count += 1
                     if len(pending) >= EXPORT_PENDING:
@@ -542,7 +615,19 @@ def export(
     mp4: bool,
     progress: Callable,
     cancel: Event,
+    *,
+    score_threshold: float = DEFAULT_DETECTION_SCORE_THRESHOLD,
+    excluded_tracks: set[int] | None = None,
 ) -> Path:
+    try:
+        score_threshold = float(score_threshold)
+    except (TypeError, ValueError):
+        raise UserError("顔検出の閾値は 0.30 〜 0.99 の範囲で指定してください。") from None
+    if not math.isfinite(score_threshold) or not DETECTION_SCORE_FLOOR <= score_threshold <= 0.99:
+        raise UserError("顔検出の閾値は 0.30 〜 0.99 の範囲で指定してください。")
+    revealed = set(revealed)
+    excluded_tracks = set(excluded_tracks or ())
+    manual = list(manual)
     # Resolve the folder only: an existing output symlink is a name collision,
     # not permission to follow its target into another folder or the input file.
     output = output.parent.resolve() / output.name
@@ -605,6 +690,7 @@ def export(
                 else {
                     stream.index: dest.add_stream_from_template(stream)
                     for stream in source.streams.audio
+                    if stream.index in info["audio_indices"]
                 }
             )
             composite = FrameCompositor(
@@ -613,7 +699,15 @@ def export(
             count = 0
             with closing(
                 composited_packets(
-                    source, original_video, analysis, revealed, manual, composite, cancel
+                    source,
+                    original_video,
+                    analysis,
+                    revealed,
+                    manual,
+                    composite,
+                    cancel,
+                    score_threshold=score_threshold,
+                    excluded_tracks=excluded_tracks,
                 )
             ) as events:
                 for is_video, value in events:
@@ -649,8 +743,7 @@ def export(
                 "-copyts",
                 "-i",
                 str(analysis.path),
-                "-map",
-                "0:a",
+                *[value for index in info["audio_indices"] for value in ("-map", f"0:{index}")],
                 "-map_metadata",
                 "-1",
                 "-vn",

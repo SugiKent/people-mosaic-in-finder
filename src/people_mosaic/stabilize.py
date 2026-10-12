@@ -22,6 +22,33 @@ class _Track:
     person: int | None
     small_since: tuple[float | None, float | None] = (None, None)
     size_history: tuple[tuple[float, float, float], ...] = ()
+    track_id: int | None = None
+    confident: bool = False
+
+
+def _continue_exclusion(face, previous, faces, tracks, timestamp):
+    """Be stricter than smoothing when carrying a user's object exclusion."""
+    if (
+        previous is None
+        or face.person != previous.person
+        or (face.confident and not previous.confident)
+    ):
+        return False
+    cx, cy = _centre(face.box)
+    px, py = _centre(previous.raw)
+    # A nearby second detection/track makes an object's correspondence ambiguous.
+    # Keep smoothing but start new exclusion IDs rather than transferring permission.
+    for other in faces:
+        if other is not face and _valid(other.box):
+            ox, oy = _centre(other.box)
+            if math.hypot(ox - cx, oy - cy) < 1.6 * max(*face.box[2:], *other.box[2:]):
+                return False
+    for other in tracks:
+        if other is not previous and 0 < timestamp - other.time <= MAX_GAP:
+            ox, oy = _centre(other.raw)
+            if math.hypot(ox - px, oy - py) < 1.6 * max(*previous.raw[2:], *other.raw[2:]):
+                return False
+    return True
 
 
 def _centre(box):
@@ -152,6 +179,7 @@ def stabilize_faces(
     tracks, result = [], []
     cuts = cuts or set()
     previous_time = None
+    next_id = 0
     for index, (faces, timestamp) in enumerate(zip(frames, times, strict=True)):
         if index in cuts or previous_time is None or not 0 < timestamp - previous_time <= MAX_GAP:
             tracks = []
@@ -162,6 +190,14 @@ def stabilize_faces(
                 output.append(face)
                 continue
             stable, track = _advance(face, timestamp, matched.get(current))
+            previous = matched.get(current)
+            if _continue_exclusion(face, previous, faces, tracks, timestamp):
+                track.track_id = previous.track_id
+            else:
+                track.track_id = next_id
+                next_id += 1
+            stable.track_id = track.track_id
+            track.confident = face.confident
             output.append(stable)
             next_tracks.append(track)
         result.append(output)
