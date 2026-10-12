@@ -29,6 +29,16 @@ def self_test():
         ).stdout.splitlines()[0]
     assert application.platformName() == os.environ["QT_QPA_PLATFORM"]
     assert "ffv1" in av.codecs_available
+    av.Codec("prores_ks", "w")
+    assert (
+        "prores_ks"
+        in subprocess.run(
+            [tool_path("ffmpeg"), "-hide_banner", "-encoders"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
     print(
         json.dumps(
             {
@@ -53,7 +63,7 @@ def smoke_test(directory):
     from people_mosaic.domain import Analysis, Face
     from people_mosaic.engine import analyze, export
     from people_mosaic.models import digest
-    from people_mosaic.overlay import cloud
+    from people_mosaic.overlay import cloud, native_plane, placement
     from people_mosaic.runtime import tool_path
 
     directory.mkdir(parents=True, exist_ok=True)
@@ -89,27 +99,78 @@ def smoke_test(directory):
         video, digest(video), 320, 240, 12, [[Face((100, 70, 70, 80))] for _ in times], times
     )
     saved = []
-    for mp4 in (False, True, True):
+    rgba = cloud()
+    for extension in ("mov", "mp4", "mp4"):
         path = export(
             analysis,
-            directory / ("sample_mosaic.mp4" if mp4 else "sample_mosaic.mkv"),
+            directory / f"sample_mosaic.{extension}",
             set(),
-            cloud(),
+            rgba,
             [],
-            mp4,
+            extension == "mp4",
             lambda *_: None,
             Event(),
+            mov=extension == "mov",
         )
         with av.open(str(path)) as result:
-            assert len(list(result.decode(video=0))) == 12
+            frames = list(result.decode(video=0))
+            assert len(frames) == 12
+            assert np.allclose([float(frame.time) for frame in frames], times, atol=0.001)
         saved.append(str(path))
     assert Path(saved[-1]).name == "sample_mosaic_1.mp4"
+    metadata = json.loads(
+        subprocess.run(
+            [tool_path("ffprobe"), "-v", "error", "-show_streams", "-of", "json", saved[0]],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )["streams"]
+    mov_video = next(stream for stream in metadata if stream["codec_type"] == "video")
+    assert mov_video["codec_name"] == "prores"
+    assert mov_video["profile"] == "HQ"
+    assert mov_video["pix_fmt"] == "yuv422p10le"
+    assert (
+        next(stream for stream in metadata if stream["codec_type"] == "audio")["codec_name"]
+        == "pcm_s16le"
+    )
     with av.open(str(video)) as original, av.open(saved[0]) as rendered:
-        before = next(original.decode(video=0)).to_ndarray(format="yuv420p")
-        after = next(rendered.decode(video=0)).to_ndarray(format="yuv420p")
-        assert np.array_equal(before[:10, :], after[:10, :])
+        before = native_plane(next(original.decode(video=0)), 0).astype(np.int32) * 4
+        after = native_plane(next(rendered.decode(video=0)), 0).astype(np.int32)
+        # ProRes HQ is an editing codec, not mathematically lossless. The top
+        # rows sit outside the cloud: bound their 10-bit quantization error.
+        difference = np.abs(before[:10, :] - after[:10, :])
+        assert difference.mean() <= 4
+        assert difference.max() <= 64
         assert not np.array_equal(before, after)
-    print(json.dumps({"analysis_frames": len(scanned.frames), "outputs": saved}))
+        x, y, patch = placement((100, 70, 70, 80), 320, 240, rgba)
+        white = (patch[:, :, :3].min(axis=2) == 255) & (patch[:, :, 3] == 255)
+        white_luma = None
+        if white.any():
+            cloud_luma = after[y : y + patch.shape[0], x : x + patch.shape[1]][white]
+            white_luma = float(np.percentile(cloud_luma, 5))
+            assert white_luma >= 232 * 4
+    with av.open(str(video)) as original, av.open(saved[0]) as rendered:
+        original_audio = np.concatenate(
+            [frame.to_ndarray() for frame in original.decode(audio=0)], axis=1
+        )
+        rendered_audio = np.concatenate(
+            [frame.to_ndarray() for frame in rendered.decode(audio=0)], axis=1
+        )
+        assert np.array_equal(original_audio, rendered_audio)
+    print(
+        json.dumps(
+            {
+                "analysis_frames": len(scanned.frames),
+                "outputs": saved,
+                "mov_codec": mov_video["codec_name"],
+                "mov_profile": mov_video["profile"],
+                "mov_pixel_format": mov_video["pix_fmt"],
+                "untouched_luma_mean_error_10bit": float(difference.mean()),
+                "white_luma_5th_percentile_10bit": white_luma,
+            }
+        )
+    )
 
 
 def main():

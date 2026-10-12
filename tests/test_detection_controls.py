@@ -89,7 +89,7 @@ def test_export_captures_threshold_and_track_exclusions(window, monkeypatch):
     window.detection_threshold.setValue(30)
     window.excluded_tracks.clear()
     operations[0](None, None)
-    assert exported == [{"score_threshold": 0.85, "excluded_tracks": {1}}]
+    assert exported == [{"mov": False, "score_threshold": 0.85, "excluded_tracks": {1}}]
 
 
 def test_busy_disables_slider_and_exclusion_undo(window):

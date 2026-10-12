@@ -18,6 +18,7 @@ import av
 import cv2
 import numpy as np
 from av.codec.hwaccel import HWAccel, hwdevices_available
+from av.video.reformatter import VideoReformatter
 
 from .color import display_bgr
 from .domain import (
@@ -71,11 +72,11 @@ def probe(path: Path) -> dict:
             "PQ HDR / Dolby Vision は未対応です。SDR または HLG HDR の動画を選んでください。"
         )
     if video.get("color_transfer") == "arib-std-b67" and (
-        video.get("pix_fmt") != "yuv420p10le"
+        video.get("pix_fmt") not in {"yuv420p10le", "yuv422p10le"}
         or video.get("color_space") != "bt2020nc"
         or video.get("color_primaries") != "bt2020"
     ):
-        raise UserError("HLG は BT.2020 の YUV 420 10bit に対応しています。")
+        raise UserError("HLG は BT.2020 の YUV 420/422 10bit に対応しています。")
     audio = [s for s in json.loads(result.stdout)["streams"] if s["codec_type"] == "audio"]
     has_aac = any(s.get("codec_name") == "aac" for s in audio)
     # iPhone MOVs may include APAC spatial audio alongside a normal AAC track.
@@ -431,9 +432,10 @@ EXPORT_PENDING = EXPORT_WORKERS * 2
 
 
 class FrameCompositor:
-    def __init__(self, rgba, rotation, hlg, pixel_format, cancel):
+    def __init__(self, rgba, rotation, hlg, pixel_format, cancel, *, limited_range=False):
         self.rgba, self.rotation, self.hlg = rgba, rotation, hlg
         self.pixel_format, self.cancel = pixel_format, cancel
+        self.limited_range = limited_range
         self.lane = local()
 
     def __call__(self, original, masks):
@@ -446,7 +448,29 @@ class FrameCompositor:
         self.lane.overlay.blend_native(frame, masks, self.hlg)
         check_cancel(self.cancel)
         if self.pixel_format:
-            frame = frame.reformat(format=self.pixel_format)
+            if self.limited_range:
+                if not hasattr(self.lane, "reformatter"):
+                    self.lane.reformatter = VideoReformatter()
+                # ProRes/MOV uses limited-range samples: changing only the tag
+                # clips full-range black/white and shifts every middle tone.
+                target_format = self.pixel_format
+                if frame.format.name == target_format and frame.color_range == 2:
+                    # PyAV's same-format fast path skips range conversion. Use
+                    # an equally precise 4:2:2 layout to force swscale to run.
+                    target_format = "p210le" if target_format == "yuv422p10le" else "yuv422p10le"
+                frame = self.lane.reformatter.reformat(
+                    frame,
+                    format=target_format,
+                    src_color_range=frame.color_range,
+                    dst_color_range=1,
+                    src_colorspace=frame.colorspace,
+                    dst_colorspace=frame.colorspace,
+                )
+                frame.color_range = 1
+                if target_format != self.pixel_format:
+                    frame = frame.reformat(format=self.pixel_format)
+            else:
+                frame = frame.reformat(format=self.pixel_format)
         return frame
 
 
@@ -555,6 +579,43 @@ def mp4_codec(analysis, info):
     raise UserError("MP4 用のエンコーダーを確認できません。アプリを再インストールしてください。")
 
 
+def mov_codec(analysis):
+    """Select ProRes 422 HQ, probing hardware before creating output files."""
+    if sys.platform == "darwin" and "prores_videotoolbox" in av.codecs_available:
+        context = av.CodecContext.create("prores_videotoolbox", "w")
+        context.width, context.height = analysis.width, analysis.height
+        context.pix_fmt = "p210le"
+        context.time_base = Fraction(1, max(1, round(analysis.fps)))
+        context.options = {"profile": "3", "allow_sw": "0"}
+        try:
+            context.open()
+            return "prores_videotoolbox"
+        except av.error.FFmpegError:
+            pass
+        finally:
+            del context
+    if "prores_ks" in av.codecs_available:
+        return "prores_ks"
+    raise UserError("MOV 用のエンコーダーを確認できません。アプリを再インストールしてください。")
+
+
+MOV_COPY_AUDIO = {
+    "aac",
+    "alac",
+    "mp3",
+    "pcm_s16le",
+    "pcm_s16be",
+    "pcm_s24le",
+    "pcm_s24be",
+    "pcm_s32le",
+    "pcm_s32be",
+    "pcm_f32le",
+    "pcm_f32be",
+    "pcm_f64le",
+    "pcm_f64be",
+}
+
+
 def remux_public_mp4(video_path: Path, audio_path: Path, output: Path, cancel: Event) -> None:
     """Copy encoded video/audio packets without CLI duration inference.
 
@@ -620,7 +681,10 @@ def export(
     *,
     score_threshold: float = DEFAULT_DETECTION_SCORE_THRESHOLD,
     excluded_tracks: set[int] | None = None,
+    mov: bool = False,
 ) -> Path:
+    if mp4 and mov:
+        raise UserError("保存形式は MP4 または MOV のどちらかを指定してください。")
     try:
         score_threshold = float(score_threshold)
     except (TypeError, ValueError):
@@ -639,12 +703,15 @@ def export(
         raise UserError("解析後に元動画が変更されました。もう一度解析してください。")
     check_cancel(cancel)
     info = probe(analysis.path)
-    copy_audio = all(codec in {"aac", "alac", "mp3"} for codec in info["audio_codecs"])
-    transcode_audio = mp4 and not copy_audio
-    codec = mp4_codec(analysis, info) if mp4 else "ffv1"
+    audio_codecs = MOV_COPY_AUDIO if mov else {"aac", "alac", "mp3"}
+    copy_audio = all(codec in audio_codecs for codec in info["audio_codecs"])
+    delivery = mp4 or mov
+    transcode_audio = delivery and not copy_audio
+    codec = mov_codec(analysis) if mov else mp4_codec(analysis, info) if mp4 else "ffv1"
+    extension = "mov" if mov else "mp4" if mp4 else "mkv"
     # Temporary media is private and is deleted on failure/cancellation.
     with tempfile.TemporaryDirectory(prefix=".people-mosaic-", dir=output.parent) as directory:
-        master = Path(directory) / ("video.mp4" if mp4 else "master.mkv")
+        master = Path(directory) / f"video.{extension}"
         with (
             av.open(str(analysis.path)) as source,
             av.open(
@@ -652,7 +719,7 @@ def export(
                 "w",
                 options=(
                     {"movflags": "+faststart", "avoid_negative_ts": "disabled"}
-                    if mp4 and not transcode_audio
+                    if delivery and not transcode_audio
                     else {"avoid_negative_ts": "disabled"}
                 ),
             ) as dest,
@@ -665,14 +732,26 @@ def export(
                 codec, rate=original_video.base_rate or original_video.average_rate or 30
             )
             video.width, video.height = analysis.width, analysis.height
-            video.pix_fmt = ("p010le" if analysis.hlg else "yuv420p") if mp4 else info["pix_fmt"]
+            if mov:
+                video.pix_fmt = "p210le" if codec == "prores_videotoolbox" else "yuv422p10le"
+            else:
+                video.pix_fmt = (
+                    ("p010le" if analysis.hlg else "yuv420p") if mp4 else info["pix_fmt"]
+                )
             video.time_base = original_video.time_base
             video.codec_context.time_base = original_video.time_base
-            video.codec_context.color_range = original_video.codec_context.color_range
+            video.codec_context.color_range = 1 if mov else original_video.codec_context.color_range
             video.codec_context.colorspace = original_video.codec_context.colorspace
             video.codec_context.color_primaries = original_video.codec_context.color_primaries
             video.codec_context.color_trc = original_video.codec_context.color_trc
-            if mp4 and "videotoolbox" in codec:
+            if mov:
+                video.options = {"profile": "3"}
+                video.codec_context.codec_tag = "apch"
+                if codec == "prores_videotoolbox":
+                    video.options["allow_sw"] = "0"
+                else:
+                    video.codec_context.thread_count = min(8, os.cpu_count() or 1)
+            elif mp4 and "videotoolbox" in codec:
                 video.bit_rate = public_bitrate(analysis, info)
                 video.options = {"profile": "main10" if analysis.hlg else "high", "allow_sw": "0"}
                 if analysis.hlg:
@@ -696,7 +775,12 @@ def export(
                 }
             )
             composite = FrameCompositor(
-                rgba, info["rotation"], analysis.hlg, video.pix_fmt if mp4 else None, cancel
+                rgba,
+                info["rotation"],
+                analysis.hlg,
+                video.pix_fmt if delivery else None,
+                cancel,
+                limited_range=mov,
             )
             count = 0
             with closing(
@@ -731,11 +815,11 @@ def export(
         check_cancel(cancel)
         final = master
         if transcode_audio:
-            progress(90, "MP4 の音声を変換中")
-            final = Path(directory) / "public.mp4"
+            progress(90, f"{extension.upper()} の音声を変換中")
+            final = Path(directory) / f"public.{extension}"
             # Convert audio only. A separate PyAV packet mux preserves the
             # masked video timeline even with older system FFmpeg versions.
-            audio_only = Path(directory) / "audio.m4a"
+            audio_only = Path(directory) / ("audio.mov" if mov else "audio.m4a")
             command = [
                 tool_path("ffmpeg"),
                 "-nostdin",
@@ -750,9 +834,8 @@ def export(
                 "-1",
                 "-vn",
                 "-c:a",
-                "aac",
-                "-b:a",
-                "256k",
+                "pcm_s24le" if mov else "aac",
+                *([] if mov else ["-b:a", "256k"]),
                 "-avoid_negative_ts",
                 "disabled",
                 "-movflags",
@@ -771,7 +854,7 @@ def export(
                             pass
                     if result:
                         raise UserError(
-                            "MP4 の書き出しに失敗しました。保存用 MKV を選ぶか入力を確認してください。"
+                            f"{extension.upper()} の音声変換に失敗しました。入力動画を確認してください。"
                         )
                 finally:
                     if process.poll() is None:

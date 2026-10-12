@@ -191,3 +191,26 @@ def test_small_screen_initial_person_checkbox_is_visible(window, qapp):
     QTest.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=check.center())
     assert window.revealed() == {0}
     assert window.canvas.isVisible()
+
+
+def test_export_choices_use_mov_for_high_quality_editing(window, monkeypatch):
+    assert window.format.count() == 2
+    assert window.format.itemText(0).startswith("MP4")
+    assert window.format.itemText(1).startswith("MOV")
+    calls = []
+    monkeypatch.setattr(
+        "people_mosaic.app.engine.export", lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+    monkeypatch.setattr(window, "start_work", lambda operation, success: operation(None, None))
+    window.format.setCurrentIndex(1)
+    assert "MOV" in window.save_note.text()
+    assert "大きく" in window.quality_note.text()
+    window.write_video()
+    args, kwargs = calls[-1]
+    assert args[1] == window.analysis.path.with_name(window.analysis.path.stem + "_mosaic.mov")
+    assert args[5] is False and kwargs["mov"] is True
+    window.format.setCurrentIndex(0)
+    window.write_video()
+    args, kwargs = calls[-1]
+    assert args[1].suffix == ".mp4"
+    assert args[5] is True and kwargs["mov"] is False

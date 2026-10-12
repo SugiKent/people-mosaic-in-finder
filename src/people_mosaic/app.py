@@ -468,7 +468,7 @@ class Window(QMainWindow):
             "保存する動画の形式", "保存先は元の動画と同じフォルダです。元の動画は残ります。"
         )
         self.format = QComboBox()
-        self.format.addItems(["MP4 · 共有用（おすすめ）", "MKV · 画質を保つ保存用"])
+        self.format.addItems(["MP4 · 共有用（おすすめ）", "MOV · 編集用（高画質）"])
         self.format.setAccessibleName("保存する動画の形式")
         self.format.currentIndexChanged.connect(self.format_changed)
         saving.addWidget(self.format)
@@ -855,9 +855,9 @@ class Window(QMainWindow):
         mp4 = self.format.currentIndex() == 0
         if self.analysis:
             output = self.analysis.path.with_name(
-                self.analysis.path.stem + "_mosaic" + (".mp4" if mp4 else ".mkv")
+                self.analysis.path.stem + "_mosaic" + (".mp4" if mp4 else ".mov")
             )
-            self.save_note.setText(f"{'MP4' if mp4 else 'MKV'} · 元の動画と同じフォルダに保存")
+            self.save_note.setText(f"{'MP4' if mp4 else 'MOV'} · 元の動画と同じフォルダに保存")
             self.save_note.setToolTip(f"{output}\n同名のファイルがあれば、末尾に番号を付けます。")
         if self.analysis and self.analysis.hlg and mp4:
             self.quality_note.setText(
@@ -867,7 +867,7 @@ class Window(QMainWindow):
             self.quality_note.setText(
                 "共有しやすい高画質の動画です。圧縮により画質は少し変わります。"
                 if mp4
-                else "雲を重ねた部分以外の画質を保ちます。ファイルが大きくなり、再生できるアプリが限られます。"
+                else "再編集で画質が崩れにくい高画質な動画です。ファイルが大きくなります。"
             )
 
     def toggle_play(self):
@@ -905,7 +905,7 @@ class Window(QMainWindow):
         if not self.analysis or self.busy():
             return
         mp4 = self.format.currentIndex() == 0
-        extension = ".mp4" if mp4 else ".mkv"
+        extension = ".mp4" if mp4 else ".mov"
         output = self.analysis.path.with_name(self.analysis.path.stem + "_mosaic" + extension)
         revealed, rgba, manual = self.revealed(), self.rgba.copy(), list(self.manual)
         threshold = self.detection_threshold.value() / 100
@@ -920,6 +920,7 @@ class Window(QMainWindow):
                 mp4,
                 progress,
                 cancel,
+                mov=not mp4,
                 score_threshold=threshold,
                 excluded_tracks=excluded,
             ),
